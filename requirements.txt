@@ -1,0 +1,16 @@
+fastapi==0.115.12
+uvicorn[standard]==0.34.2
+playwright==1.51.0
+httpx==0.28.1
+pandas==3.0.2
+numpy==2.4.4
+beautifulsoup4==4.13.4
+cryptography==44.0.3
+pydantic==2.11.4
+requests==2.32.3
+Pillow==11.2.1
+lxml==5.4.0
+python-multipart==0.0.20
+starlette==0.46.2
+openpyxl==3.1.2
+python-dotenv==1.0.1

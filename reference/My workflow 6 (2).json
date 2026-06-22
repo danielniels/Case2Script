@@ -1,0 +1,99 @@
+{
+  "name": "My workflow 6",
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "cd0d0c6f-52be-42e6-9538-f6bb3ca1901f",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2.1,
+      "position": [
+        0,
+        0
+      ],
+      "id": "40459c9a-3b3f-41b6-9e08-4de71cbe3d0b",
+      "name": "Webhook",
+      "webhookId": "cd0d0c6f-52be-42e6-9538-f6bb3ca1901f"
+    },
+    {
+      "parameters": {
+        "fieldToSplitOut": "body.test_suites",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.splitOut",
+      "typeVersion": 1,
+      "position": [
+        208,
+        0
+      ],
+      "id": "566773b0-4a81-4158-8c58-b940ba0a6c0b",
+      "name": "Split Out"
+    },
+    {
+      "parameters": {
+        "workflowId": {
+          "__rl": true,
+          "value": "DNbrCKTIx1ZB0mh4",
+          "mode": "list",
+          "cachedResultUrl": "/workflow/DNbrCKTIx1ZB0mh4",
+          "cachedResultName": "Trigger Workflow from Sub-Workflow - AMETHYST -  5"
+        },
+        "workflowInputs": {
+          "mappingMode": "defineBelow",
+          "value": {},
+          "matchingColumns": [],
+          "schema": [],
+          "attemptToConvertTypes": false,
+          "convertFieldsToString": true
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.executeWorkflow",
+      "typeVersion": 1.3,
+      "position": [
+        416,
+        0
+      ],
+      "id": "44ecf341-b063-4c85-950a-f094230af956",
+      "name": "Call 'Trigger Workflow from Sub-Workflow - AMETHYST -  5'"
+    }
+  ],
+  "pinData": {},
+  "connections": {
+    "Webhook": {
+      "main": [
+        [
+          {
+            "node": "Split Out",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Split Out": {
+      "main": [
+        [
+          {
+            "node": "Call 'Trigger Workflow from Sub-Workflow - AMETHYST -  5'",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": true,
+  "settings": {
+    "executionOrder": "v1",
+    "binaryMode": "separate"
+  },
+  "versionId": "79915677-ac65-44e8-ab9b-023120cdaef7",
+  "meta": {
+    "instanceId": "1e00dd95588ec6547e3bb7f251d4b4f0989304201ee8191df4da25ac18966fea"
+  },
+  "id": "yli2F8izHksmHs6w",
+  "tags": []
+}

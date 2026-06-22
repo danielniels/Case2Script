@@ -1,0 +1,654 @@
+{
+  "name": "Trigger Workflow from Sub-Workflow - AMETHYST -  5",
+  "nodes": [
+    {
+      "parameters": {
+        "inputSource": "passthrough"
+      },
+      "id": "a5bc9898-e6ef-481d-af32-a4034c223d82",
+      "typeVersion": 1.1,
+      "name": "When Executed by Another Workflow",
+      "type": "n8n-nodes-base.executeWorkflowTrigger",
+      "position": [
+        3376,
+        3680
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// ============================================================\n// ⚙️  CONFIG — Edit all technical settings here\n// For system prompt → edit the [System Prompt] node instead\n// ============================================================\n\nreturn [{\n  json: {\n    ...($input.first()?.json ?? {}),\n    _config: {\n      // MCP Server\n      // mcp_url: \"http://172.16.13.170:8000/mcp\",\n      mcp_url: \"http://host.docker.internal:8000/mcp\",\n      // LLM Provider: \"ollama\" | \"claude\"\n      llm_provider: \"ollama\",\n      // Ollama settings\n      ollama_url: \"http://172.16.15.59:11434/api/chat\",\n      ollama_model: \"gemma4:31b-cloud\",\n    }\n  }\n}];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        3568,
+        3680
+      ],
+      "id": "5531ec7f-dee0-4eb1-b903-514435887891",
+      "name": "Config"
+    },
+    {
+      "parameters": {
+        "assignments": {
+          "assignments": [
+            {
+              "id": "sp-field-001",
+              "name": "system_prompt",
+              "value": "You are an automation JSON generator for a Playwright MCP server.\nOutput ONLY valid JSON. No explanation, no markdown, no comments.\n\nOutput format:\n{\n  \"method\": \"<method>\",\n  \"params\": { \"sessionId\": \"<sessionId>\", ...other params }\n}\n\n================================\nTOOLS\n================================\n\nnavigate          | params: sessionId, url\nclick             | params: sessionId, selector (XPath)\nfill              | params: sessionId, selector (XPath), text\nselect_option     | params: sessionId, selector (XPath), value (option label text)\nhover             | params: sessionId, selector (XPath)\ndouble_click      | params: sessionId, selector (XPath)\nscroll_to_element | params: sessionId, selector (XPath)\nclear_input       | params: sessionId, selector (XPath)\npress_key         | params: sessionId, key (\"Escape\" | \"Enter\" | \"Tab\" | \"ArrowDown\" | \"ArrowUp\" | \"Backspace\")\nupload_file       | params: sessionId, selector (XPath targeting <input type=\"file\">), files (absolute path string)\nswitch_tab        | params: sessionId, index (int, 0-based) OR url_contains (string)\nclick_by_index    | params: sessionId, index (int, from elements list)\n\nscreenshot           | params: sessionId only\nassert_text          | params: sessionId, selector (XPath), expected (text substring)\nassert_visible       | params: sessionId, selector (XPath)\nassert_not_visible   | params: sessionId, selector (XPath)\nassert_disabled      | params: sessionId, selector (XPath)\nassert_url           | params: sessionId, expected (URL substring)\nget_page_info        | params: sessionId only\nget_page_content     | params: sessionId only\n\nget_text                      | params: sessionId, selector (XPath)\nget_all_text                  | params: sessionId, selector (XPath)\nget_attribute                 | params: sessionId, selector (XPath), attribute (e.g. \"href\")\nget_page_content_and_save_csv | params: sessionId only\nget_page_content_and_save_txt | params: sessionId only\n\nwait_for_load     | params: sessionId, state (\"load\" | \"networkidle\" | \"domcontentloaded\"), timeout (ms)\nwait_for_selector | params: sessionId, selector (XPath), state (\"visible\" | \"hidden\"), timeout (ms)\nclose_session     | params: sessionId only\nget_credentials   | params: sessionId, name (credential name string)\n\n================================\nDECISION GUIDE\n================================\n\nStep mentions: \"berhasil\", \"sukses\", \"halaman X\", \"tampil\", \"muncul\", \"valid:\", \"verify\"\n  → screenshot (visual confirm)\n  → assert_text if specific data must be verified (e.g. \"VALID: Data Ditemukan → Annual Leave\")\n  → assert_visible if specific element must exist\n\nStep mentions: \"tutup popup\", \"close modal\", \"press esc\", \"tekan esc\", \"dismiss\"\n  → press_key, key: \"Escape\"\n\nStep mentions: \"pilih X → Y\" or \"pilih X: Y\" or \"select X: Y\" (dropdown)\n  → select_option, value: text after \"→\" or \":\"\n\nStep mentions: \"mengisi X → Y\" or \"isi X → Y\"\n  → fill, text: exact value after \"→\" or \":\"\n\nStep mentions: \"upload\", \"unggah\", \"lampiran\", \"attach\", \"supporting file\", \"file →\"\n  → upload_file\n  → selector: XPath targeting the file <input type=\"file\"> element\n  → files: exact path string after \"→\" in the step description\n\nStep mentions: \"centang\", \"checklist\", \"ceklis\", \"checkbox\"\n  → click\n  → selector: MUST use //input[@id=\"<id>\"] from AVAILABLE ELEMENTS\n  → NEVER construct //label[contains(...)]//input pattern\n  → NEVER target the <label> — always click the <input> directly\n\nStep is exactly: \"crawl\"\n  → get_page_content_and_save_csv\n\nStep mentions logout, then \"berhasil logout\"\n  → click for logout button, then assert_url or screenshot for verification\n\nCan't determine XPath from elements:\n  → click_by_index using index from AVAILABLE ELEMENTS list\n\n================================\nXPATH RULES (MANDATORY)\n================================\n\nPriority — use highest available from AVAILABLE ELEMENTS:\n1. //TAG[@id=\"value\"]                                    ← always first if id exists\n2. //TAG[@aria-label=\"value\"]                            ← hyphen, never underscore\n3. //TAG[@name=\"value\"]\n4. //TAG[@placeholder=\"value\"]\n5. //TAG[.//text()[normalize-space(.) = \"value\"]]        ← last resort\n\nRules:\n- If @id exists → ALWAYS use @id, never switch to text or aria-label\n- NEVER use @aria_label (underscore) — always @aria-label (hyphen)\n- NEVER use normalize-space(text()) — always normalize-space(.)\n- NEVER use @type alone (e.g. //INPUT[@type=\"email\"])\n- NEVER guess or invent attribute values — use ONLY exact values from AVAILABLE ELEMENTS\n- NEVER include text param for click\n- For fill steps with multiple similar fields (e.g. TKI Laki-Laki, TKI Perempuan, Tenaga Kerja Asing):\n  → Match the field label EXACTLY to the element text in AVAILABLE ELEMENTS\n  → Each field has a unique id — NEVER reuse the same selector for different fields\n  → If unsure, use suggested_selector from AVAILABLE ELEMENTS\n\n================================\nTEST DATA\n================================\n\nIf TEST DATA is provided:\n- fill \"username\" / \"email\" field → use email value from TEST DATA\n- fill \"password\" field → use password value from TEST DATA\n- NEVER use the key name as fill value, always use the VALUE\n\n================================\nCONSTRAINTS\n================================\n- Skip elements with id/name containing \"autoComplete\"\n- Prefer enabled over disabled elements when multiple match\n- For Select2 dropdowns → always use select_option, never click the hidden <option>\n- sessionId is always required in every params\n- ALWAYS prefer suggested_selector from AVAILABLE ELEMENTS over self-constructed XPath\n- suggested_selector is pre-validated — trust it over your own XPath generation",
+              "type": "string"
+            }
+          ]
+        },
+        "includeOtherFields": true,
+        "options": {}
+      },
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [
+        3760,
+        3680
+      ],
+      "id": "742e894b-a928-482e-94c3-41e9041ee00a",
+      "name": "System Prompt"
+    },
+    {
+      "parameters": {
+        "jsCode": "const suite = $json;\nreturn suite.cases.map(tc => ({\n  json: {\n    test_suite_id: suite.test_suite_id,\n    ...tc\n  }\n}));"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        3968,
+        3680
+      ],
+      "id": "61b7c130-7763-43a2-a171-4ff1e499e619",
+      "name": "Explode Cases per Suite1"
+    },
+    {
+      "parameters": {
+        "jsCode": "const tc = $json;\nconst steps = tc.steps || [];\n\nreturn steps.map((s, idx) => ({\n  json: {\n    test_suite_id: tc.test_suite_id,\n    test_case_id: tc.test_case_id,\n    test_case_name: tc.test_case_name,\n    test_data: tc.test_data || {},\n    step_index: idx + 1,\n    total_steps: steps.length,\n    test_step_id: s.test_step_id,\n    test_step_description: String(s.test_step_description || '').trim()\n  },\n  pairedItem: { item: 0 }\n}));\n"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        4192,
+        3680
+      ],
+      "id": "e0415a5c-1c23-44c8-8fbb-2bedbad0fa96",
+      "name": "Explode steps"
+    },
+    {
+      "parameters": {
+        "batchSize": "=1",
+        "options": {
+          "reset": false
+        }
+      },
+      "type": "n8n-nodes-base.splitInBatches",
+      "typeVersion": 3,
+      "position": [
+        4400,
+        3680
+      ],
+      "id": "79c454f3-d3dd-4ef2-befe-3f625a4de32b",
+      "name": "Test Step"
+    },
+    {
+      "parameters": {
+        "jsCode": "const elements = $json.result?.elements ?? [];\nconst stepData  = $('Test Step').item.json;\nconst step      = stepData.test_step_description ?? '';\nconst sessionId = `session_${$execution.id}_${stepData.test_suite_id}`;\nconst testData  = stepData.test_data ?? {};\n\nlet attempt = 1, retryCtx = null;\ntry {\n  const pr = $('Prep Retry').item.json;\n  if (pr?.attempt) { attempt = pr.attempt; retryCtx = pr.retry_context; }\n} catch(e) {}\n\n// ── Compact element format — jauh lebih hemat token ──────────────\nconst MAX_EL = 50;\nconst elLines = elements.slice(0, MAX_EL).map((el, i) => {\n  const parts = [\n    `[${i}]`,\n    el.tag,\n    el.id        ? `id=\"${el.id}\"`               : null,\n    el.name      ? `name=\"${el.name}\"`            : null,\n    el.type      ? `type=\"${el.type}\"`            : null,\n    el.aria_label? `aria-label=\"${el.aria_label}\"`  : null,\n    el.placeholder?`placeholder=\"${el.placeholder}\"`: null,\n    el.disabled  ? `DISABLED`                    : null,\n    el.text      ? `\"${el.text.slice(0,60)}\"`    : null,\n    el.suggested_selector ? `→ ${el.suggested_selector}` : null,\n  ].filter(Boolean);\n  return parts.join(' ');\n});\nconst elStr = elLines.join('\\n');\n// ─────────────────────────────────────────────────────────────────\nconst finalPrompt = [\n  $('System Prompt').item.json.system_prompt,\n  `SESSION ID: ${sessionId}`,\n  `AVAILABLE ELEMENTS (${elements.length} total, showing ${elLines.length}):\\n${elStr}`,\n  Object.keys(testData).length > 0 ? `TEST DATA:\\n${JSON.stringify(testData)}` : null,\n  `STEP: \"${step}\"`,\n].filter(Boolean).join('\\n\\n');\n\nconsole.log('=== PROMPT DEBUG ===');\nconsole.log('system_prompt chars:', $('System Prompt').item.json.system_prompt?.length);\nconsole.log('elements str chars:', elStr.length);\nconsole.log('total prompt chars:', finalPrompt.length);\nconsole.log('====================');\n\nreturn [{ json: { prompt: finalPrompt } }];\n\nreturn [{\n  json: {\n    prompt: [\n      $('System Prompt').item.json.system_prompt,\n      `SESSION ID: ${sessionId}`,\n      `AVAILABLE ELEMENTS (${elements.length} total, showing ${elLines.length}):\\n${elStr}`,\n      Object.keys(testData).length > 0\n        ? `TEST DATA:\\n${JSON.stringify(testData)}`\n        : null,\n      retryCtx\n        ? `⚠️ RETRY ${attempt}/3 — FAILED: ${retryCtx.error}\\nDo NOT repeat same index. Pick different element.`\n        : null,\n      `STEP: \"${step}\"`,\n      `Output JSON only.`\n    ].filter(Boolean).join('\\n\\n')\n  }\n}];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        4832,
+        3696
+      ],
+      "id": "e70adfae-3922-4279-beda-ccbea5b2bb2f",
+      "name": "build prompt"
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $('Config').item.json._config.ollama_url }}",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ {\n  \"model\": $('Config').item.json._config.ollama_model,\n  \"messages\": [\n    {\n      \"role\": \"user\",\n      \"content\": $json.prompt\n    }\n  ],\n  \"stream\": false,\n  \"think\": false\n} }}",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.3,
+      "position": [
+        5200,
+        3696
+      ],
+      "id": "50fc0b23-1d52-4fcd-a89c-9e3e1a462c85",
+      "name": "Ollama call",
+      "retryOnFail": true,
+      "waitBetweenTries": 5000
+    },
+    {
+      "parameters": {
+        "jsCode": "const raw = $json.response\n         ?? $json.message?.content\n         ?? $json.content?.[0]?.text\n         ?? $json.data\n         ?? \"\";\n\nconst looksLikeError = !raw || raw.trim().length < 5 ||\n  /^(callback|undefined|null|error|TypeError|ReferenceError|SyntaxError)/i.test(raw.trim());\n\nconst cleaned = raw\n  .replace(/<think>[\\s\\S]*?<\\/think>/gi, '')\n  .trim()\n  .replace(/^```(?:json)?\\s*/i, '')\n  .replace(/\\s*```$/i, '')\n  .trim();\n\nconst looksLikeJSON = cleaned.startsWith('{') || cleaned.startsWith('[');\n\nconst _attempt = (() => {\n  try { return $('Prep Retry').item.json?.attempt ?? 1; } catch(e) { return 1; }\n})();\n\nif (looksLikeError || !looksLikeJSON) {\n  const stepData = $('Test Step').item.json;\n  return [{\n    json: {\n      _llm_error: true,\n      _attempt,\n      _raw_response: String(raw).slice(0, 200),\n      method: \"noop\",\n      params: {},\n      meta: {\n        test_suite_id:         stepData.test_suite_id,\n        test_case_id:          stepData.test_case_id,\n        test_case_name:        stepData.test_case_name,\n        step_index:            stepData.step_index,\n        total_steps:           stepData.total_steps,\n        test_step_id:          stepData.test_step_id,\n        test_step_description: stepData.test_step_description\n      }\n    }\n  }];\n}\n\nlet parsed;\ntry {\n  parsed = JSON.parse(cleaned);\n} catch (e) {\n  throw new Error('LLM returned invalid JSON: ' + raw.slice(0, 300));\n}\n\nif (!parsed.method && parsed.action) {\n  parsed.method = parsed.action;\n}\n\nif (!parsed.method) {\n  if (parsed.value !== undefined && (parsed.field || parsed.target || parsed.selector)) {\n    parsed.method = \"fill\";\n  } else if (parsed.url) {\n    parsed.method = \"navigate\";\n  } else if (parsed.target || parsed.selector || parsed.field) {\n    parsed.method = \"click\";\n  }\n}\n\nif (parsed.method && !parsed.params) {\n  parsed.params = {\n    selector: parsed.selector || parsed.target || parsed.field || \"\",\n    text: parsed.text || parsed.value || \"\",\n    url: parsed.url || \"\"\n  };\n}\n\nif (!parsed.method) {\n  throw new Error('LLM JSON missing method field. Raw: ' + raw.slice(0, 300));\n}\n\nconst stepData = $('Test Step').item.json;\nreturn [{\n  json: {\n    ...parsed,\n    _attempt,\n    meta: {\n      test_suite_id:         stepData.test_suite_id,\n      test_case_id:          stepData.test_case_id,\n      test_case_name:        stepData.test_case_name,\n      step_index:            stepData.step_index,\n      total_steps:           stepData.total_steps,\n      test_step_id:          stepData.test_step_id,\n      test_step_description: stepData.test_step_description\n    }\n  }\n}];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        5488,
+        3696
+      ],
+      "id": "6d6a43c1-08b4-49a4-ab74-06277c2eba54",
+      "name": "Parse LLM JSON"
+    },
+    {
+      "parameters": {
+        "jsCode": "const html = $json.executed?.content ?? \"\";\n\nif (!html || typeof html !== \"string\") {\n  return [{\n    json: {\n      ok: $json.ok ?? false,\n      meta: $json.meta ?? null,\n      llm_command: $json.llm_command ?? null,\n      title: $json.title ?? null,\n      plain_text: null,\n      plain_text_len: 0,\n      snippet: null,\n      csv_saved: $json.executed?.csv_saved ?? null,\n      message: $json.executed?.message ?? null\n    }\n  }];\n}\n\nconst title = (html.match(/<title>([\\s\\S]*?)<\\/title>/i)?.[1] ?? \"\").trim() || ($json.title ?? null);\n\nfunction extractMain(h) {\n  const m1 = h.match(/<div[^>]*id=\"xwikicontent\"[^>]*>([\\s\\S]*?)<\\/div>\\s*<\\/div>\\s*<\\/main>/i);\n  if (m1?.[1]) return m1[1];\n  const m2 = h.match(/<main[^>]*>([\\s\\S]*?)<\\/main>/i);\n  if (m2?.[1]) return m2[1];\n  return h;\n}\n\nlet mainHtml = extractMain(html)\n  .replace(/<script[\\s\\S]*?<\\/script>/gi, \" \")\n  .replace(/<style[\\s\\S]*?<\\/style>/gi, \" \")\n  .replace(/<noscript[\\s\\S]*?<\\/noscript>/gi, \" \");\n\nlet text = mainHtml\n  .replace(/<br\\s*\\/?>/gi, \"\\n\")\n  .replace(/<\\/p>/gi, \"\\n\")\n  .replace(/<\\/li>/gi, \"\\n\")\n  .replace(/<[^>]+>/g, \" \")\n  .replace(/&nbsp;/g, \" \").replace(/&amp;/g, \"&\")\n  .replace(/&lt;/g, \"<\").replace(/&gt;/g, \">\")\n  .replace(/&quot;/g, '\"').replace(/&#39;/g, \"'\")\n  .replace(/[ \\t]+\\n/g, \"\\n\")\n  .replace(/\\n{3,}/g, \"\\n\\n\")\n  .replace(/[ \\t]{2,}/g, \" \")\n  .trim();\n\nreturn [{\n  json: {\n    ...$json,\n    title,\n    plain_text: text,\n    plain_text_len: text.length,\n    snippet: text.slice(0, 500),\n    csv_saved: $json.executed?.csv_saved ?? null,\n    message: $json.executed?.message ?? null\n  }\n}];\n"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        6544,
+        3408
+      ],
+      "id": "465f7632-8794-4527-9106-45b72bd36377",
+      "name": "Clean Page Content1"
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "438780fd-cc42-487a-b229-0cc32ac57134",
+              "leftValue": "=={{ Number($json.step_index ?? $json[0]?.meta?.step_index ?? 0) }}\n",
+              "rightValue": "=4",
+              "operator": {
+                "type": "string",
+                "operation": "equals",
+                "name": "filter.operator.equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        6960,
+        3408
+      ],
+      "id": "a0ce8cfe-0780-4ca6-a4a0-85214e0847f6",
+      "name": "If1"
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $('Config').item.json._config.mcp_url }}",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "{\n  \"jsonrpc\": \"2.0\",\n  \"method\": \"wait_for_load\",\n  \"params\": {\n    \"sessionId\": \"{{ 'session_' + $execution.id + '_' + $('Test Step').item.json.test_suite_id }}\",\n    \"state\": \"load\",\n    \"timeout\": 15000\n  },\n  \"id\": 201\n}\n",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.3,
+      "position": [
+        7184,
+        3392
+      ],
+      "id": "32ede400-5b56-405e-82f7-8eddb1f1e2a1",
+      "name": "HTTP Request1"
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "http://103.107.205.86:3000/api/robot/history",
+        "sendBody": true,
+        "contentType": "raw",
+        "rawContentType": "application/json",
+        "body": "=={{ JSON.stringify({  job_name: $('Test Step').item.json.test_case_name,  run_id: $('Test Step').item.json.test_case_id,  process_name: $('Test Step').item.json.test_step_description,  status: $json.ok ? 'Completed' : 'Failed',  detail: $json.snippet || '',  start: $('Prepare Payload for MCP Playwright').item.json.step_started_at,  end: new Date().toISOString(),  step_index: $('Test Step').item.json.step_index,  total_steps: $('Test Step').item.json.total_steps,  test_step_id: $('Test Step').item.json.test_step_id}) }}",
+        "options": {
+          "response": {
+            "response": {
+              "neverError": true
+            }
+          }
+        }
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.3,
+      "position": [
+        6752,
+        3408
+      ],
+      "id": "c2f7007e-c4dd-4290-bae5-c66e81d38678",
+      "name": "Post to History API - Amethyst",
+      "disabled": true
+    },
+    {
+      "parameters": {
+        "mode": "raw",
+        "jsonOutput": "={\n  \"test_case_id\": {{$('Explode Cases per Suite1').item.json.test_case_id}},\n  \"test_suite_id\": {{$('Explode Cases per Suite1').item.json.test_suite_id}},\n  \"status\": \"completed\"\n}\n",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [
+        4640,
+        3312
+      ],
+      "id": "d900ce42-fd5e-43a4-8f80-041c10ec79e5",
+      "name": "Marking Test Case"
+    },
+    {
+      "parameters": {
+        "jsCode": "// Output the complete flat body for POST /mcp (ExecuteRequest format)\nconst meta = $json.meta || {};\nconst attempt = $json._attempt ?? 1;\nconst final_attempt = attempt >= 3;\n\nconst sessionId = `session_${$execution.id}_${meta.test_suite_id}`;\n\nconst params = { ...($json.params || {}) };\ndelete params.sessionId;\n\nreturn [{\n  json: {\n    sessionId: sessionId,\n    method: $json.method,\n    params: params,\n    test_suite_id: meta.test_suite_id,\n    test_case_id: meta.test_case_id,\n    test_case_name: meta.test_case_name,\n    step_index:  meta.step_index,\n    total_steps: meta.total_steps,\n    test_step_id: meta.test_step_id,\n    test_step_description: meta.test_step_description,\n    step_started_at: new Date().toISOString(),\n    final_attempt: final_attempt,\n    expected_result: meta.test_step_description,\n  }\n}];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        5696,
+        3696
+      ],
+      "id": "14d8d722-5cde-4a84-889b-a1d12d291fac",
+      "name": "Prepare Payload for MCP Playwright"
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $('Config').item.json._config.mcp_url }}",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ $json }}",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.3,
+      "position": [
+        5904,
+        3696
+      ],
+      "id": "8317c821-2c4a-48f4-94c6-759b15d6d386",
+      "name": "Execute Browser Action"
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $('Config').item.json._config.mcp_url }}",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={\n  \"jsonrpc\": \"2.0\",\n  \"method\": \"get_interactable_elements\",\n  \"params\": {\n    \"sessionId\": \"{{ 'session_' + $execution.id + '_' + $json.test_suite_id }}\"\n  },\n  \"id\": 100\n}",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.3,
+      "position": [
+        4624,
+        3696
+      ],
+      "id": "a70ca715-7dcc-4e7f-8f71-5d9ffd81ef3b",
+      "name": "Get Browser Interactables"
+    },
+    {
+      "parameters": {
+        "jsCode": "const item = $input.first().json;\n\nlet attempt = 1;\ntry {\n  const pr = $('Prep Retry').item.json;\n  if (pr?.attempt) attempt = pr.attempt;\n} catch(e) {\n  // Code Prep Retry hasn't run yet — this is attempt 1\n  attempt = 1;\n}\n\nreturn [{\n  json: {\n    ...item,\n    _attempt:   attempt,\n    _can_retry: attempt < 3   // max 3 total attempts\n  }\n}];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        6320,
+        3792
+      ],
+      "id": "83a7d37f-7dae-468b-91a6-f2b6b30a7a4c",
+      "name": "Check Retry"
+    },
+    {
+      "parameters": {
+        "jsCode": "const item   = $input.first().json;   // Code \"Check Retry\" output\nconst step   = $('Test Step').item.json;\n\nreturn [{\n  json: {\n    // Fields needed by Get Browser Interactables session ID\n    test_suite_id:         step.test_suite_id,\n    test_case_id:          step.test_case_id,\n    test_case_name:        step.test_case_name,\n    test_data:             step.test_data ?? {},\n    step_index:            step.step_index,\n    total_steps:           step.total_steps,\n    test_step_id:          step.test_step_id,\n    test_step_description: step.test_step_description,\n\n    // Retry state\n    attempt:       item._attempt + 1,\n    retry_context: {\n      previous_command: item.llm_command ?? null,\n      error:            item.error       ?? null,\n      error_type:       item.error_type  ?? null,\n    }\n  }\n}];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        6928,
+        3920
+      ],
+      "id": "55f4c787-e1f0-42ed-b642-bb0bfbc736c4",
+      "name": "Prep Retry"
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 3
+          },
+          "conditions": [
+            {
+              "id": "87cdb5d3-14e8-4163-9cb8-b3d6e1dac2f0",
+              "leftValue": "={{ $json.ok }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.3,
+      "position": [
+        6112,
+        3696
+      ],
+      "id": "5934e49f-b876-48bf-bd5e-62e7315418df",
+      "name": "IF Step Success"
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 3
+          },
+          "conditions": [
+            {
+              "id": "3d404e02-28e5-4241-af3e-038ba1febf94",
+              "leftValue": "={{ $json._can_retry }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.3,
+      "position": [
+        6576,
+        3792
+      ],
+      "id": "914a1920-d98c-4a4d-b6df-f70cdbd9aa2d",
+      "name": "IF Can Retry?"
+    }
+  ],
+  "pinData": {},
+  "connections": {
+    "When Executed by Another Workflow": {
+      "main": [
+        [
+          {
+            "node": "Config",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Config": {
+      "main": [
+        [
+          {
+            "node": "System Prompt",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "System Prompt": {
+      "main": [
+        [
+          {
+            "node": "Explode Cases per Suite1",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Explode Cases per Suite1": {
+      "main": [
+        [
+          {
+            "node": "Explode steps",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Explode steps": {
+      "main": [
+        [
+          {
+            "node": "Test Step",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Test Step": {
+      "main": [
+        [
+          {
+            "node": "Marking Test Case",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Get Browser Interactables",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "build prompt": {
+      "main": [
+        [
+          {
+            "node": "Ollama call",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Ollama call": {
+      "main": [
+        [
+          {
+            "node": "Parse LLM JSON",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Parse LLM JSON": {
+      "main": [
+        [
+          {
+            "node": "Prepare Payload for MCP Playwright",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Clean Page Content1": {
+      "main": [
+        [
+          {
+            "node": "Post to History API - Amethyst",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "If1": {
+      "main": [
+        [
+          {
+            "node": "HTTP Request1",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Test Step",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "HTTP Request1": {
+      "main": [
+        [
+          {
+            "node": "Test Step",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Post to History API - Amethyst": {
+      "main": [
+        [
+          {
+            "node": "If1",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Prepare Payload for MCP Playwright": {
+      "main": [
+        [
+          {
+            "node": "Execute Browser Action",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Execute Browser Action": {
+      "main": [
+        [
+          {
+            "node": "IF Step Success",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Get Browser Interactables": {
+      "main": [
+        [
+          {
+            "node": "build prompt",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Check Retry": {
+      "main": [
+        [
+          {
+            "node": "IF Can Retry?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Prep Retry": {
+      "main": [
+        [
+          {
+            "node": "Get Browser Interactables",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "IF Step Success": {
+      "main": [
+        [
+          {
+            "node": "Clean Page Content1",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Check Retry",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "IF Can Retry?": {
+      "main": [
+        [
+          {
+            "node": "Prep Retry",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Clean Page Content1",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": true,
+  "settings": {
+    "executionOrder": "v1",
+    "binaryMode": "separate"
+  },
+  "versionId": "5216ddc3-7cc3-40db-96c8-a7ec995633bb",
+  "meta": {
+    "instanceId": "1e00dd95588ec6547e3bb7f251d4b4f0989304201ee8191df4da25ac18966fea"
+  },
+  "id": "DNbrCKTIx1ZB0mh4",
+  "tags": []
+}
