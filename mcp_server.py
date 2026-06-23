@@ -12,8 +12,8 @@ Endpoints:
   GET  /runs/*       (mounted from orchestrator)
   GET  /suites/*     (mounted from suites_store)
   POST /convert/*    (mounted from converters)
-  GET  /api/scripts  Read .js script file
-  POST /api/scripts  Write .js script file
+  GET  /api/scripts  Read .js or .py script file
+  POST /api/scripts  Write .js or .py script file
 """
 
 # Load .env before importing any module that reads env vars
@@ -216,10 +216,13 @@ class _ScriptWrite(_BM):
     content: str
 
 
+_ALLOWED_SCRIPT_SUFFIXES = {".js", ".py"}
+
+
 @app.get("/api/scripts")
 async def read_script(path: str):
     p = Path(path)
-    if not p.exists() or p.suffix != ".js":
+    if not p.exists() or p.suffix not in _ALLOWED_SCRIPT_SUFFIXES:
         from fastapi import HTTPException
         raise HTTPException(status_code=404, detail="Script not found")
     return {"path": path, "content": p.read_text(encoding="utf-8")}
@@ -228,9 +231,9 @@ async def read_script(path: str):
 @app.post("/api/scripts")
 async def write_script(body: _ScriptWrite):
     p = Path(body.path)
-    if p.suffix != ".js":
+    if p.suffix not in _ALLOWED_SCRIPT_SUFFIXES:
         from fastapi import HTTPException
-        raise HTTPException(status_code=400, detail="Only .js scripts can be saved")
+        raise HTTPException(status_code=400, detail="Only .js or .py scripts can be saved")
     p.parent.mkdir(parents=True, exist_ok=True)
     p.write_text(body.content, encoding="utf-8")
     return {"saved": True, "path": body.path}
@@ -239,10 +242,11 @@ async def write_script(body: _ScriptWrite):
 @app.get("/api/scripts/download")
 async def download_script(path: str):
     p = Path(path)
-    if not p.exists() or p.suffix != ".js":
+    if not p.exists() or p.suffix not in _ALLOWED_SCRIPT_SUFFIXES:
         from fastapi import HTTPException
         raise HTTPException(status_code=404, detail="Script not found")
-    return FileResponse(str(p), filename=p.name, media_type="application/javascript")
+    media_type = "application/javascript" if p.suffix == ".js" else "text/x-python"
+    return FileResponse(str(p), filename=p.name, media_type=media_type)
 
 
 # ==================== Serve Static Data Files (screenshots, reports) ====================

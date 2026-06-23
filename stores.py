@@ -1,6 +1,7 @@
 """
 Session, SessionManager, ReportStore, ScriptStore + script generation.
-Depends on: helpers.py (for _js, _method_to_js)
+Depends on: helpers.py (for _js — used by the disabled JS generator, kept for reference).
+Playwright script output is Python-only via generate_playwright_py_from_json.
 """
 
 import asyncio
@@ -8,6 +9,7 @@ import base64
 import json
 import os
 import re
+import textwrap
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, Optional
@@ -181,47 +183,344 @@ class ReportStore:
             return list(self._commands.get(test_case_id, []))
 
 
-# ==================== Script Store JS Templates ====================
+# # ==================== Script Store JS Templates ====================
 
-_JS_TEMPLATES = {
+# _JS_TEMPLATES = {
+#     "navigate": lambda p: (
+#         f"await page.goto({_js(p.get('url',''))}, {{ waitUntil: 'domcontentloaded' }});\n"
+#         f"    await page.waitForLoadState('load').catch(() => {{}});\n"
+#         f"    await page.waitForLoadState('networkidle').catch(() => {{}});"
+#     ),
+
+#     "click": lambda p: (
+#         f"await page.evaluate((sel) => {{\n"
+#         f"      let el;\n"
+#         f"      const xsel = sel.startsWith('xpath=') ? sel.slice(6) : sel;\n"
+#         f"      if (xsel.startsWith('//')) {{\n"
+#         f"          const r = document.evaluate(xsel, document, null, XPathResult.FIRST_ORDERED_NODE_TYPE, null);\n"
+#         f"          el = r.singleNodeValue;\n"
+#         f"      }} else {{\n"
+#         f"          el = document.querySelector(xsel);\n"
+#         f"      }}\n"
+#         f"      if (el) el.click();\n"
+#         f"  }}, {_js(p.get('selector',''))}).catch(() => {{}});\n"
+#         f"    await page.waitForLoadState('load').catch(() => {{}});\n"
+#         f"    await page.waitForLoadState('networkidle').catch(() => {{}});\n"
+#         f"    await page.waitForTimeout(800);"
+#     ),
+
+#     "click_at_position": lambda p: "\n    ".join([
+#         f"await page.locator({_js(p.get('selector', '.mapwrap svg'))}).first().click({{ position: {{ x: {c['x']}, y: {c['y']} }} }});\n    await page.waitForTimeout(300);"
+#         for c in (p.get('clicks') or [{"x": p.get('x', 0), "y": p.get('y', 0)}])
+#     ]),
+
+#     "fill": lambda p:
+#         f"await page.locator({_js(p.get('selector',''))}).first().fill({_js(p.get('text',''))});",
+
+#     "select_option": lambda p: (
+#         f"await page.evaluate(({{sel, val}}) => {{\n"
+#         f"  let el;\n"
+#         f"  if (sel.startsWith('//') || sel.startsWith('xpath=')) {{\n"
+#         f"    el = document.evaluate(sel, document, null, XPathResult.FIRST_ORDERED_NODE_TYPE, null).singleNodeValue;\n"
+#         f"  }} else {{\n"
+#         f"    el = document.querySelector(sel);\n"
+#         f"  }}\n"
+#         f"  if (!el) return false;\n"
+#         f"  const opt = Array.from(el.options).find(o => o.value === val || o.text.trim() === val);\n"
+#         f"  if (!opt) return false;\n"
+#         f"  const nativeSetter = Object.getOwnPropertyDescriptor(window.HTMLSelectElement.prototype, 'value');\n"
+#         f"  if (nativeSetter?.set) nativeSetter.set.call(el, opt.value);\n"
+#         f"  else el.value = opt.value;\n"
+#         f"  el.dispatchEvent(new Event('change', {{ bubbles: true }}));\n"
+#         f"  el.dispatchEvent(new Event('input', {{ bubbles: true }}));\n"
+#         f"  return true;\n"
+#         f"}}, {{ sel: {_js(p.get('selector',''))}, val: {_js(p.get('value',''))} }});"
+#     ),
+
+#     "press_key": lambda p: (
+#         f"await page.keyboard.press({_js(p.get('key','Escape'))});"
+#         f"await page.waitForTimeout(1000);"
+#     ),
+
+#     "screenshot": lambda p:
+#         f"await page.screenshot({{ path: {_js(p.get('path','screenshot.png'))} }});",
+
+#     "wait_for_load": lambda p:
+#         f"await page.waitForLoadState({_js(p.get('state','load'))});",
+
+#     "wait_for_selector": lambda p:
+#         f"await page.waitForSelector({_js(p.get('selector',''))}, {{ state: {_js(p.get('state','visible'))} }});",
+
+#     "hover": lambda p:
+#         f"await page.locator({_js(p.get('selector',''))}).first().hover();",
+
+#     "double_click": lambda p:
+#         f"await page.dblclick({_js(p.get('selector',''))});",
+
+#     "scroll_to_element": lambda p:
+#         f"await page.locator({_js(p.get('selector',''))}).scrollIntoViewIfNeeded();",
+
+#     "clear_input": lambda p:
+#         f"await page.fill({_js(p.get('selector',''))}, '');",
+
+#     "upload_file": lambda p:
+#         f"await page.setInputFiles({_js(p.get('selector',''))}, {__import__('json').dumps(p.get('files',[]) if isinstance(p.get('files'), list) else [p.get('files','')])});",
+
+#     "assert_text": lambda p: (
+#         '{ const t = (await page.locator(' + _js(p["selector"]) + ').first().innerText()).trim(); '
+#         'if (!t.includes(' + _js(p["expected"]) + ')) '
+#         'throw new Error("assert_text failed — expected " + ' + _js(p["expected"]) + ' + ", got: " + t); }'
+#     ),
+#     "assert_visible": lambda p: (
+#         'if (!await page.locator(' + _js(p["selector"]) + ').first().isVisible()) '
+#         'throw new Error("assert_visible failed: " + ' + _js(p["selector"]) + ');'
+#     ),
+#     "assert_not_visible": lambda p: (
+#         '{ const c = await page.locator(' + _js(p["selector"]) + ').count(); '
+#         'if (c > 0 && await page.locator(' + _js(p["selector"]) + ').first().isVisible()) '
+#         'throw new Error("assert_not_visible failed, element visible: " + ' + _js(p["selector"]) + '); }'
+#     ),
+#     "assert_disabled": lambda p: (
+#         'if (!await page.locator(' + _js(p["selector"]) + ').first().isDisabled()) '
+#         'throw new Error("assert_disabled failed, element enabled: " + ' + _js(p["selector"]) + ');'
+#     ),
+#     "assert_url": lambda p: (
+#         'if (!page.url().includes(' + _js(p["expected"]) + ')) '
+#         'throw new Error("assert_url failed — got: " + page.url());'
+#     ),
+#     "assert_toast": lambda p: (
+#         '{ const _exp = ' + _js(p.get("expected_text", "")) + '; '
+#         'const _to = ' + str(int(p.get("timeout", 6000))) + '; '
+#         'const _all = [...document.querySelectorAll('
+#         '"[role=alert],[role=status],[class*=toast],[class*=swal2],[class*=alert],[class*=snackbar],[class*=notyf]"'
+#         ')].filter(e => { const s = window.getComputedStyle(e); return s.display !== "none" && s.visibility !== "hidden" && e.offsetParent !== null; }); '
+#         'const _t = _all.map(e => (e.innerText || e.textContent || "").trim()).join(" "); '
+#         'if (_exp && !_t.toLowerCase().includes(_exp.toLowerCase())) '
+#         'throw new Error("assert_toast failed — expected: " + _exp + ", got: " + _t); '
+#         'if (!_exp && !_all.length) throw new Error("assert_toast failed — no notification visible"); }'
+#     ),
+#     "execute_js": lambda p:
+#         f"await page.evaluate({_js(p.get('script', ''))});",
+# }
+
+# _JS_SKIP = {
+#     "get_interactable_elements", "get_page_content", "get_page_info",
+#     "get_page_content_and_save_csv", "get_page_content_and_save_txt",
+#     "get_credentials", "close_session",
+# }
+
+
+# def _method_to_js(method: str, params: dict) -> Optional[str]:
+#     """Convert one MCP step → Playwright JS statement."""
+#     handler = _JS_TEMPLATES.get(method)
+#     if not handler:
+#         return None
+#     try:
+#         return handler(params)
+#     except Exception:
+#         return None
+
+
+# # ==================== Playwright Script Generator (JS) — DISABLED ====================
+# # Full Node.js/Playwright generator. Disabled in favor of the Python generator
+# # below (generate_playwright_py_from_json). Kept here, commented, in case the
+# # JS output path needs to come back.
+
+# def generate_playwright_from_json(json_path: str) -> Optional[str]:
+#     """
+#     Read a saved MCP script JSON and generate a standalone Node.js Playwright script.
+#     Source of truth = the .json file. Output: data/saved_playwright_scripts/<stem>.js
+#     """
+#     try:
+#         with open(json_path, "r", encoding="utf-8") as f:
+#             data = json.load(f)
+#     except Exception as e:
+#         print(f"[Playwright Generator] Cannot read {json_path}: {e}")
+#         return None
+
+#     steps = data.get("steps", []) if isinstance(data, dict) else data
+#     if not steps:
+#         print(f"[Playwright Generator] No steps in {json_path}")
+#         return None
+
+#     stem = Path(json_path).stem
+#     pw_dir = Path("data/saved_playwright_scripts")
+#     pw_dir.mkdir(parents=True, exist_ok=True)
+#     js_path = str(pw_dir / f"{stem}.js")
+
+#     lines = [
+#         f"// Auto-generated Playwright script — {stem}",
+#         f"// Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
+#         f"// Source: {Path(json_path).name}",
+#         f"// Run: node {stem}.js",
+#         "// Requires: npm install playwright && npx playwright install chromium",
+#         "",
+#         "const { chromium } = require('playwright');",
+#         "const { mkdirSync } = require('fs');",
+#         "",
+#         f"mkdirSync('data/saved_playwright_scripts/screenshots/{stem}', {{ recursive: true }});",
+#         "",
+#         "async function runTest() {",
+#         "  const browser = await chromium.launch({ headless: false });",
+#         "  const context = await browser.newContext({ ignoreHTTPSErrors: true });",
+#         "  const page = await context.newPage();",
+#         "",
+#         "  try {",
+#     ]
+
+#     for step in steps:
+#         method  = step.get("method", "")
+#         params  = {k: v for k, v in step.get("params", {}).items() if k != "sessionId"}
+#         desc    = step.get("step", "")
+#         status  = step.get("status", "passed")
+#         step_id = step.get("id", "?")
+
+#         params = dict(params)
+#         resolved = params.get("resolved_selector", "")
+#         if resolved and ("[" in resolved or "@" in resolved or "#" in resolved):
+#             params["selector"] = resolved
+#         elif params.get("selector"):
+#             params["selector"] = re.sub(r'\s+\d+(")\]$', r'\1]', params["selector"])
+
+#         lines.append("")
+
+#         if method in _JS_SKIP:
+#             lines.append(f"    // [Step {step_id}] {desc} [{method}] — MCP-only, skipped")
+#             continue
+
+#         if status == "failed":
+#             lines.append(f"    // STEP {step_id} FAILED [{method}] — fix manually before running")
+#             lines.append(f"    // {desc}")
+#             js_line = _method_to_js(method, params)
+#             if js_line:
+#                 lines.append(f"    // {js_line}")
+#             continue
+
+#         lines.append(f"    // Step {step_id}: {desc}")
+#         lines.append(f"    console.log('▶ STEP {step_id}');")
+
+#         if method == "screenshot":
+#             ss_path = f"data/saved_playwright_scripts/screenshots/{stem}/step_{step_id}.png"
+#             lines.append(f"    await page.screenshot({{ path: {_js(ss_path)} }});")
+#             continue
+
+#         js_line = _method_to_js(method, params)
+#         if js_line:
+#             lines.append(f"    {js_line}")
+#             ss_auto = f"data/saved_playwright_scripts/screenshots/{stem}/step_{step_id}.png"
+#             lines.append(f"    await page.screenshot({{ path: {_js(ss_auto)} }});")
+
+#     lines += [
+#         "",
+#         "    console.log('Test completed');",
+#         "  } catch (err) {",
+#         "    console.error('Test failed:', err.message);",
+#         "    process.exit(1);",
+#         "  } finally {",
+#         "    await browser.close();",
+#         "  }",
+#         "}",
+#         "",
+#         "runTest();",
+#     ]
+
+#     with open(js_path, "w", encoding="utf-8") as f:
+#         f.write("\n".join(lines))
+
+#     print(f"[Playwright Generator] Script generated: {js_path}")
+#     return js_path
+
+
+# ==================== Script Store PY Templates ====================
+# NOTE: anything passed INTO page.evaluate(...) is still JavaScript — it runs
+# in the browser context and uses _js() (above) to build those snippets.
+# _py() below is only for the OUTER python-side Playwright driver calls.
+# Every lambda here returns a flat, zero-indent multi-line Python block;
+# the generator re-indents it with textwrap.indent() — do not hand-indent
+# continuation lines inside these lambdas.
+
+def _py(s) -> str:
+    """Safely wrap a value as a Python string literal (outer/driver-side code)."""
+    return repr(str(s))
+
+
+_PY_TEMPLATES = {
     "navigate": lambda p: (
-        f"await page.goto({_js(p.get('url',''))}, {{ waitUntil: 'domcontentloaded' }});\n"
-        f"    await page.waitForLoadState('load').catch(() => {{}});\n"
-        f"    await page.waitForLoadState('networkidle').catch(() => {{}});"
+        f"await page.goto({_py(p.get('url',''))}, wait_until='domcontentloaded')\n"
+        f"try:\n"
+        f"    await page.wait_for_load_state('load')\n"
+        f"except Exception:\n"
+        f"    pass\n"
+        f"try:\n"
+        f"    await page.wait_for_load_state('networkidle')\n"
+        f"except Exception:\n"
+        f"    pass"
     ),
 
     "click": lambda p: (
-        f"await page.evaluate((sel) => {{\n"
-        f"      let el;\n"
-        f"      const xsel = sel.startsWith('xpath=') ? sel.slice(6) : sel;\n"
-        f"      if (xsel.startsWith('//')) {{\n"
-        f"          const r = document.evaluate(xsel, document, null, XPathResult.FIRST_ORDERED_NODE_TYPE, null);\n"
-        f"          el = r.singleNodeValue;\n"
-        f"      }} else {{\n"
-        f"          el = document.querySelector(xsel);\n"
+        f"try:\n"
+        f"    await page.evaluate(\"\"\"(sel) => {{\n"
+        f"  function isVisible(node) {{\n"
+        f"    const s = window.getComputedStyle(node);\n"
+        f"    return s.display !== 'none' && s.visibility !== 'hidden' && node.offsetParent !== null;\n"
+        f"  }}\n"
+        f"  let el;\n"
+        f"  const xsel = sel.startsWith('xpath=') ? sel.slice(6) : sel;\n"
+        f"  if (xsel.startsWith('//')) {{\n"
+        f"      const r = document.evaluate(xsel, document, null, XPathResult.ORDERED_NODE_SNAPSHOT_TYPE, null);\n"
+        f"      for (let i = 0; i < r.snapshotLength; i++) {{\n"
+        f"          const node = r.snapshotItem(i);\n"
+        f"          if (isVisible(node)) {{ el = node; break; }}\n"
         f"      }}\n"
-        f"      if (el) el.click();\n"
-        f"  }}, {_js(p.get('selector',''))}).catch(() => {{}});\n"
-        f"    await page.waitForLoadState('load').catch(() => {{}});\n"
-        f"    await page.waitForLoadState('networkidle').catch(() => {{}});\n"
-        f"    await page.waitForTimeout(800);"
+        f"  }} else {{\n"
+        f"      const nodes = document.querySelectorAll(xsel);\n"
+        f"      for (const node of nodes) {{\n"
+        f"          if (isVisible(node)) {{ el = node; break; }}\n"
+        f"      }}\n"
+        f"  }}\n"
+        f"  if (el) el.click();\n"
+        f"}}\"\"\", {_py(p.get('selector',''))})\n"
+        f"except Exception:\n"
+        f"    pass\n"
+        f"try:\n"
+        f"    await page.wait_for_load_state('load')\n"
+        f"except Exception:\n"
+        f"    pass\n"
+        f"try:\n"
+        f"    await page.wait_for_load_state('networkidle')\n"
+        f"except Exception:\n"
+        f"    pass\n"
+        f"await page.wait_for_timeout(800)"
     ),
 
-    "click_at_position": lambda p: "\n    ".join([
-        f"await page.locator({_js(p.get('selector', '.mapwrap svg'))}).first().click({{ position: {{ x: {c['x']}, y: {c['y']} }} }});\n    await page.waitForTimeout(300);"
+    "click_at_position": lambda p: "\n".join([
+        f"await page.locator({_py(p.get('selector', '.mapwrap svg'))}).first.click(position={{'x': {c['x']}, 'y': {c['y']}}})\n"
+        f"await page.wait_for_timeout(300)"
         for c in (p.get('clicks') or [{"x": p.get('x', 0), "y": p.get('y', 0)}])
     ]),
 
     "fill": lambda p:
-        f"await page.locator({_js(p.get('selector',''))}).first().fill({_js(p.get('text',''))});",
+        f"await page.locator({_py(p.get('selector',''))}).first.fill({_py(p.get('text',''))})",
 
     "select_option": lambda p: (
-        f"await page.evaluate(({{sel, val}}) => {{\n"
+        f"await page.evaluate(\"\"\"({{sel, val}}) => {{\n"
+        f"  function isVisible(node) {{\n"
+        f"    const s = window.getComputedStyle(node);\n"
+        f"    return s.display !== 'none' && s.visibility !== 'hidden' && node.offsetParent !== null;\n"
+        f"  }}\n"
         f"  let el;\n"
         f"  if (sel.startsWith('//') || sel.startsWith('xpath=')) {{\n"
-        f"    el = document.evaluate(sel, document, null, XPathResult.FIRST_ORDERED_NODE_TYPE, null).singleNodeValue;\n"
+        f"    const xsel = sel.startsWith('xpath=') ? sel.slice(6) : sel;\n"
+        f"    const r = document.evaluate(xsel, document, null, XPathResult.ORDERED_NODE_SNAPSHOT_TYPE, null);\n"
+        f"    for (let i = 0; i < r.snapshotLength; i++) {{\n"
+        f"        const node = r.snapshotItem(i);\n"
+        f"        if (isVisible(node)) {{ el = node; break; }}\n"
+        f"    }}\n"
         f"  }} else {{\n"
-        f"    el = document.querySelector(sel);\n"
+        f"    const nodes = document.querySelectorAll(sel);\n"
+        f"    for (const node of nodes) {{\n"
+        f"        if (isVisible(node)) {{ el = node; break; }}\n"
+        f"    }}\n"
         f"  }}\n"
         f"  if (!el) return false;\n"
         f"  const opt = Array.from(el.options).find(o => o.value === val || o.text.trim() === val);\n"
@@ -232,85 +531,89 @@ _JS_TEMPLATES = {
         f"  el.dispatchEvent(new Event('change', {{ bubbles: true }}));\n"
         f"  el.dispatchEvent(new Event('input', {{ bubbles: true }}));\n"
         f"  return true;\n"
-        f"}}, {{ sel: {_js(p.get('selector',''))}, val: {_js(p.get('value',''))} }});"
+        f"}}\"\"\", {{'sel': {_py(p.get('selector',''))}, 'val': {_py(p.get('value',''))}}})"
     ),
 
     "press_key": lambda p: (
-        f"await page.keyboard.press({_js(p.get('key','Escape'))});"
-        f"await page.waitForTimeout(1000);"
+        f"await page.keyboard.press({_py(p.get('key','Escape'))})\n"
+        f"await page.wait_for_timeout(1000)"
     ),
 
     "screenshot": lambda p:
-        f"await page.screenshot({{ path: {_js(p.get('path','screenshot.png'))} }});",
+        f"await page.screenshot(path={_py(p.get('path','screenshot.png'))})",
 
     "wait_for_load": lambda p:
-        f"await page.waitForLoadState({_js(p.get('state','load'))});",
+        f"await page.wait_for_load_state({_py(p.get('state','load'))})",
 
     "wait_for_selector": lambda p:
-        f"await page.waitForSelector({_js(p.get('selector',''))}, {{ state: {_js(p.get('state','visible'))} }});",
+        f"await page.wait_for_selector({_py(p.get('selector',''))}, state={_py(p.get('state','visible'))})",
 
     "hover": lambda p:
-        f"await page.locator({_js(p.get('selector',''))}).first().hover();",
+        f"await page.locator({_py(p.get('selector',''))}).first.hover()",
 
     "double_click": lambda p:
-        f"await page.dblclick({_js(p.get('selector',''))});",
+        f"await page.dblclick({_py(p.get('selector',''))})",
 
     "scroll_to_element": lambda p:
-        f"await page.locator({_js(p.get('selector',''))}).scrollIntoViewIfNeeded();",
+        f"await page.locator({_py(p.get('selector',''))}).scroll_into_view_if_needed()",
 
     "clear_input": lambda p:
-        f"await page.fill({_js(p.get('selector',''))}, '');",
+        f"await page.fill({_py(p.get('selector',''))}, '')",
 
-    "upload_file": lambda p:
-        f"await page.setInputFiles({_js(p.get('selector',''))}, {__import__('json').dumps(p.get('files',[]) if isinstance(p.get('files'), list) else [p.get('files','')])});",
+    "upload_file": lambda p: (
+        f"await page.set_input_files({_py(p.get('selector',''))}, "
+        f"{p.get('files', []) if isinstance(p.get('files'), list) else [p.get('files','')]!r})"
+    ),
 
     "assert_text": lambda p: (
-        '{ const t = (await page.locator(' + _js(p["selector"]) + ').first().innerText()).trim(); '
-        'if (!t.includes(' + _js(p["expected"]) + ')) '
-        'throw new Error("assert_text failed — expected " + ' + _js(p["expected"]) + ' + ", got: " + t); }'
+        f"t = (await page.locator({_py(p['selector'])}).first.inner_text()).strip()\n"
+        f"if {_py(p['expected'])} not in t:\n"
+        f"    raise AssertionError(f\"assert_text failed — expected {p['expected']!r}, got: {{t}}\")"
     ),
     "assert_visible": lambda p: (
-        'if (!await page.locator(' + _js(p["selector"]) + ').first().isVisible()) '
-        'throw new Error("assert_visible failed: " + ' + _js(p["selector"]) + ');'
+        f"if not await page.locator({_py(p['selector'])}).first.is_visible():\n"
+        f"    raise AssertionError(f\"assert_visible failed: {{{_py(p['selector'])}}}\")"
     ),
     "assert_not_visible": lambda p: (
-        '{ const c = await page.locator(' + _js(p["selector"]) + ').count(); '
-        'if (c > 0 && await page.locator(' + _js(p["selector"]) + ').first().isVisible()) '
-        'throw new Error("assert_not_visible failed, element visible: " + ' + _js(p["selector"]) + '); }'
+        f"_c = await page.locator({_py(p['selector'])}).count()\n"
+        f"if _c > 0 and await page.locator({_py(p['selector'])}).first.is_visible():\n"
+        f"    raise AssertionError(f\"assert_not_visible failed, element visible: {p['selector']!r}\")"
     ),
     "assert_disabled": lambda p: (
-        'if (!await page.locator(' + _js(p["selector"]) + ').first().isDisabled()) '
-        'throw new Error("assert_disabled failed, element enabled: " + ' + _js(p["selector"]) + ');'
+        f"if not await page.locator({_py(p['selector'])}).first.is_disabled():\n"
+        f"    raise AssertionError(f\"assert_disabled failed, element enabled: {p['selector']!r}\")"
     ),
     "assert_url": lambda p: (
-        'if (!page.url().includes(' + _js(p["expected"]) + ')) '
-        'throw new Error("assert_url failed — got: " + page.url());'
+        f"if {_py(p['expected'])} not in page.url:\n"
+        f"    raise AssertionError(f\"assert_url failed — got: {{page.url}}\")"
     ),
     "assert_toast": lambda p: (
-        '{ const _exp = ' + _js(p.get("expected_text", "")) + '; '
-        'const _to = ' + str(int(p.get("timeout", 6000))) + '; '
-        'const _all = [...document.querySelectorAll('
-        '"[role=alert],[role=status],[class*=toast],[class*=swal2],[class*=alert],[class*=snackbar],[class*=notyf]"'
-        ')].filter(e => { const s = window.getComputedStyle(e); return s.display !== "none" && s.visibility !== "hidden" && e.offsetParent !== null; }); '
-        'const _t = _all.map(e => (e.innerText || e.textContent || "").trim()).join(" "); '
-        'if (_exp && !_t.toLowerCase().includes(_exp.toLowerCase())) '
-        'throw new Error("assert_toast failed — expected: " + _exp + ", got: " + _t); '
-        'if (!_exp && !_all.length) throw new Error("assert_toast failed — no notification visible"); }'
+        f"_result = await page.evaluate(\"\"\"() => {{\n"
+        f"  const _all = [...document.querySelectorAll(\n"
+        f"    \"[role=alert],[role=status],[class*=toast],[class*=swal2],[class*=alert],[class*=snackbar],[class*=notyf]\"\n"
+        f"  )].filter(e => {{ const s = window.getComputedStyle(e); return s.display !== 'none' && s.visibility !== 'hidden' && e.offsetParent !== null; }});\n"
+        f"  return _all.map(e => (e.innerText || e.textContent || '').trim()).join(' ');\n"
+        f"}}\"\"\")\n"
+        f"_exp = {_py(p.get('expected_text', ''))}\n"
+        f"if _exp and _exp.lower() not in _result.lower():\n"
+        f"    raise AssertionError(f\"assert_toast failed — expected: {{_exp}}, got: {{_result}}\")\n"
+        f"if not _exp and not _result:\n"
+        f"    raise AssertionError(\"assert_toast failed — no notification visible\")"
     ),
     "execute_js": lambda p:
-        f"await page.evaluate({_js(p.get('script', ''))});",
+        f"await page.evaluate({_py(p.get('script', ''))})",
 }
 
-_JS_SKIP = {
+_PY_SKIP = {
     "get_interactable_elements", "get_page_content", "get_page_info",
     "get_page_content_and_save_csv", "get_page_content_and_save_txt",
     "get_credentials", "close_session",
 }
 
 
-def _method_to_js(method: str, params: dict) -> Optional[str]:
-    """Convert one MCP step → Playwright JS statement."""
-    handler = _JS_TEMPLATES.get(method)
+def _method_to_py(method: str, params: dict) -> Optional[str]:
+    """Convert one MCP step → Playwright Python statement (flat, zero-indent)."""
+    handler = _PY_TEMPLATES.get(method)
     if not handler:
         return None
     try:
@@ -319,12 +622,13 @@ def _method_to_js(method: str, params: dict) -> Optional[str]:
         return None
 
 
-# ==================== Playwright Script Generator ====================
+# ==================== Playwright PYTHON Script Generator ====================
 
-def generate_playwright_from_json(json_path: str) -> Optional[str]:
+def generate_playwright_py_from_json(json_path: str) -> Optional[str]:
     """
-    Read a saved MCP script JSON and generate a standalone Node.js Playwright script.
-    Source of truth = the .json file. Output: data/saved_playwright_scripts/<stem>.js
+    Read a saved MCP script JSON and generate a standalone async Python
+    Playwright script (mirrors the live MCP server, which runs async_playwright).
+    Source of truth = the .json file. Output: data/saved_playwright_scripts_py/<stem>.py
     """
     try:
         with open(json_path, "r", encoding="utf-8") as f:
@@ -339,28 +643,33 @@ def generate_playwright_from_json(json_path: str) -> Optional[str]:
         return None
 
     stem = Path(json_path).stem
-    pw_dir = Path("data/saved_playwright_scripts")
+    pw_dir = Path("data/saved_playwright_scripts_py")
     pw_dir.mkdir(parents=True, exist_ok=True)
-    js_path = str(pw_dir / f"{stem}.js")
+    py_path = str(pw_dir / f"{stem}.py")
+    screenshots_dir = f"data/saved_playwright_scripts_py/screenshots/{stem}"
 
     lines = [
-        f"// Auto-generated Playwright script — {stem}",
-        f"// Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
-        f"// Source: {Path(json_path).name}",
-        f"// Run: node {stem}.js",
-        "// Requires: npm install playwright && npx playwright install chromium",
+        f"# Auto-generated Playwright script — {stem}",
+        f"# Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
+        f"# Source: {Path(json_path).name}",
+        f"# Run: python {stem}.py",
+        "# Requires: pip install playwright && playwright install chromium",
         "",
-        "const { chromium } = require('playwright');",
-        "const { mkdirSync } = require('fs');",
+        "import asyncio",
+        "import os",
+        "from playwright.async_api import async_playwright",
         "",
-        f"mkdirSync('data/saved_playwright_scripts/screenshots/{stem}', {{ recursive: true }});",
+        f"SCREENSHOT_DIR = {_py(screenshots_dir)}",
+        "os.makedirs(SCREENSHOT_DIR, exist_ok=True)",
         "",
-        "async function runTest() {",
-        "  const browser = await chromium.launch({ headless: false });",
-        "  const context = await browser.newContext({ ignoreHTTPSErrors: true });",
-        "  const page = await context.newPage();",
         "",
-        "  try {",
+        "async def run_test():",
+        "    async with async_playwright() as pw:",
+        "        browser = await pw.chromium.launch(headless=False)",
+        "        context = await browser.new_context(ignore_https_errors=True)",
+        "        page = await context.new_page()",
+        "",
+        "        try:",
     ]
 
     for step in steps:
@@ -371,59 +680,66 @@ def generate_playwright_from_json(json_path: str) -> Optional[str]:
         step_id = step.get("id", "?")
 
         params = dict(params)
+        original = params.get("selector", "")
         resolved = params.get("resolved_selector", "")
-        if resolved and ("[" in resolved or "@" in resolved or "#" in resolved):
+        # Prefer original selector; fall back to resolved_selector only when
+        # original is empty. resolved_selector can contain broken XPath when
+        # the button text itself contains double quotes (double-quote inside a
+        # double-quoted XPath string literal → invalid XPath).
+        if original:
+            params["selector"] = re.sub(r'\s+\d+(")\]$', r'\1]', original)
+        elif resolved and ("[" in resolved or "@" in resolved or "#" in resolved):
             params["selector"] = resolved
-        elif params.get("selector"):
-            params["selector"] = re.sub(r'\s+\d+(")\]$', r'\1]', params["selector"])
 
         lines.append("")
 
-        if method in _JS_SKIP:
-            lines.append(f"    // [Step {step_id}] {desc} [{method}] — MCP-only, skipped")
+        if method in _PY_SKIP:
+            lines.append(f"            # [Step {step_id}] {desc} [{method}] — MCP-only, skipped")
             continue
 
         if status == "failed":
-            lines.append(f"    // STEP {step_id} FAILED [{method}] — fix manually before running")
-            lines.append(f"    // {desc}")
-            js_line = _method_to_js(method, params)
-            if js_line:
-                lines.append(f"    // {js_line}")
+            lines.append(f"            # STEP {step_id} FAILED [{method}] — fix manually before running")
+            lines.append(f"            # {desc}")
+            py_line = _method_to_py(method, params)
+            if py_line:
+                commented = "\n".join(f"# {sub}" for sub in py_line.split("\n"))
+                lines.append(textwrap.indent(commented, "            ").rstrip())
             continue
 
-        lines.append(f"    // Step {step_id}: {desc}")
-        lines.append(f"    console.log('▶ STEP {step_id}');")
+        lines.append(f"            # Step {step_id}: {desc}")
+        lines.append(f"            print('>> STEP {step_id}')")
 
         if method == "screenshot":
-            ss_path = f"data/saved_playwright_scripts/screenshots/{stem}/step_{step_id}.png"
-            lines.append(f"    await page.screenshot({{ path: {_js(ss_path)} }});")
+            ss_path = f"{screenshots_dir}/step_{step_id}.png"
+            lines.append(f"            await page.screenshot(path={_py(ss_path)})")
             continue
 
-        js_line = _method_to_js(method, params)
-        if js_line:
-            lines.append(f"    {js_line}")
-            ss_auto = f"data/saved_playwright_scripts/screenshots/{stem}/step_{step_id}.png"
-            lines.append(f"    await page.screenshot({{ path: {_js(ss_auto)} }});")
+        py_line = _method_to_py(method, params)
+        if py_line:
+            lines.append(textwrap.indent(py_line, "            ").rstrip())
+            ss_auto = f"{screenshots_dir}/step_{step_id}.png"
+            lines.append(f"            await page.screenshot(path={_py(ss_auto)})")
 
     lines += [
         "",
-        "    console.log('Test completed');",
-        "  } catch (err) {",
-        "    console.error('Test failed:', err.message);",
-        "    process.exit(1);",
-        "  } finally {",
-        "    await browser.close();",
-        "  }",
-        "}",
+        "            print('Test completed')",
+        "        except Exception as err:",
+        "            print(f'Test failed: {err}')",
+        "            raise",
+        "        finally:",
+        "            await browser.close()",
         "",
-        "runTest();",
+        "",
+        'if __name__ == "__main__":',
+        "    asyncio.run(run_test())",
+        "",
     ]
 
-    with open(js_path, "w", encoding="utf-8") as f:
+    with open(py_path, "w", encoding="utf-8") as f:
         f.write("\n".join(lines))
 
-    print(f"[Playwright Generator] Script generated: {js_path}")
-    return js_path
+    print(f"[Playwright Generator] Python script generated: {py_path}")
+    return py_path
 
 
 # ==================== Script Store ====================
@@ -506,9 +822,9 @@ class ScriptStore:
             with open(path, "w", encoding="utf-8") as f:
                 json.dump(final, f, indent=2, ensure_ascii=False)
 
-            js_path = generate_playwright_from_json(path)
-            if js_path:
-                print(f"[ScriptStore] Playwright script: {js_path}")
+            py_path = generate_playwright_py_from_json(path)
+            if py_path:
+                print(f"[ScriptStore] Playwright script (PY): {py_path}")
 
             print(f"[ScriptStore] Script finalized: {path}")
             if failed:

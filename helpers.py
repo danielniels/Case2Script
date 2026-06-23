@@ -12,6 +12,8 @@ from urllib.parse import urlparse
 
 from playwright.async_api import Page, Locator
 
+from toast_constants import TOAST_FAILURE_PHRASES, TOAST_SUCCESS_PHRASES
+
 
 # ==================== JS string helper ====================
 
@@ -87,6 +89,27 @@ def screenshot_to_base64(screenshot_path: str) -> Optional[str]:
             return base64.b64encode(f.read()).decode("utf-8")
     except Exception:
         return None
+
+
+def resolve_toast_type(toast_type: str, toast_text: str) -> str:
+    """
+    Upgrade an 'unknown' JS verdict using a curated text-phrase whitelist.
+    Never overrides a class-based 'success'/'error' verdict from JS —
+    CSS class detection is more reliable than text matching, so it always
+    wins. Layer 3 in the resolution chain (after CSS class + generic
+    OK/ERR keyword, both already decided in JS).
+    """
+    if toast_type != "unknown" or not toast_text:
+        return toast_type
+
+    text_lower = toast_text.lower()
+
+    if any(phrase in text_lower for phrase in TOAST_FAILURE_PHRASES):
+        return "error"
+    if any(phrase in text_lower for phrase in TOAST_SUCCESS_PHRASES):
+        return "success"
+
+    return toast_type
 
 
 def generate_expected_result(method: str, params: dict, step_description: str,
@@ -509,12 +532,23 @@ async def _select2_pick(page: Page, selector: str, value: str) -> bool:
         ([selector, value]) => {
             let select = null;
             try {
+                function isVisible(node) {
+                    const s = window.getComputedStyle(node);
+                    return s.display !== 'none' && s.visibility !== 'hidden' && node.offsetParent !== null;
+                }
                 let el = null;
                 if (selector.startsWith('//') || selector.startsWith('xpath=')) {
-                    el = document.evaluate(selector.replace('xpath=',''), document, null,
-                        XPathResult.FIRST_ORDERED_NODE_TYPE, null).singleNodeValue;
+                    const xsel = selector.replace('xpath=','');
+                    const r = document.evaluate(xsel, document, null, XPathResult.ORDERED_NODE_SNAPSHOT_TYPE, null);
+                    for (let i = 0; i < r.snapshotLength; i++) {
+                        const node = r.snapshotItem(i);
+                        if (isVisible(node)) { el = node; break; }
+                    }
                 } else {
-                    el = document.querySelector(selector);
+                    const nodes = document.querySelectorAll(selector);
+                    for (const node of nodes) {
+                        if (isVisible(node)) { el = node; break; }
+                    }
                 }
                 if (el?.tagName === 'SELECT') select = el;
                 else if (el?.tagName === 'OPTION') select = el.closest('select');

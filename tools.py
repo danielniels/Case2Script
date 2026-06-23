@@ -7,6 +7,7 @@ import asyncio
 import base64
 import os
 import re
+import time
 from datetime import datetime
 from io import StringIO
 from pathlib import Path
@@ -22,6 +23,7 @@ from helpers import (
     _force_action,
     _select2_pick,
     normalize_selector,
+    resolve_toast_type,
     screenshot_to_base64,
 )
 from stores import Session
@@ -72,15 +74,20 @@ _ARM_JS = """() => {
       d.style.cssText=(r.width>0 ? `position:fixed;left:${r.left}px;top:${r.top}px;width:${r.width}px;`
                                  : `position:fixed;top:12px;right:12px;`)+'z-index:2147483647;pointer-events:none;';
       document.body.appendChild(d);
+      el.style.opacity='0';
       return {type, text:txt};
     };
-    const scan = n => { if(isNotif(n)&&visible(n))return n;
-      if(n.querySelectorAll) for(const c of n.querySelectorAll('*')) if(isNotif(c)&&visible(c))return c; return null; };
+    const hasText = el => {
+      const t = (el.innerText||'').trim();
+      return t.length > 1 && !/^[×x✕✖✗]$/i.test(t);
+    };
+    const scan = n => { if(isNotif(n)&&visible(n)&&hasText(n))return n;
+      if(n.querySelectorAll) for(const c of n.querySelectorAll('*')) if(isNotif(c)&&visible(c)&&hasText(c))return c; return null; };
     const obs = new MutationObserver(ms => { for(const m of ms) for(const n of m.addedNodes){
       const hit=scan(n); if(hit){obs.disconnect(); resolve(grab(hit)); return;} }});
     obs.observe(document.body, {childList:true, subtree:true});
     setTimeout(() => {
-      const all=[...document.querySelectorAll('[role=alert],[role=status],[class*=toast],[class*=swal2],[class*=alert],[class*=snackbar],[class*=notyf]')].filter(visible);
+      const all=[...document.querySelectorAll('[role=alert],[role=status],[class*=toast],[class*=swal2],[class*=alert],[class*=snackbar],[class*=notyf]')].filter(el => visible(el) && hasText(el));
       if(all.length){ obs.disconnect(); resolve(grab(all[all.length-1])); }
     }, 50);
   });
@@ -134,12 +141,23 @@ async def cmd_select_option(params: dict, session: Session):
             is_select = await session.page.evaluate("""
                 (sel) => {
                     try {
+                        function isVisible(node) {
+                            const s = window.getComputedStyle(node);
+                            return s.display !== 'none' && s.visibility !== 'hidden' && node.offsetParent !== null;
+                        }
                         let el = null;
                         if (sel.startsWith('//') || sel.startsWith('xpath=')) {
-                            el = document.evaluate(sel.replace('xpath=',''), document, null,
-                                XPathResult.FIRST_ORDERED_NODE_TYPE, null).singleNodeValue;
+                            const xsel = sel.replace('xpath=','');
+                            const r = document.evaluate(xsel, document, null, XPathResult.ORDERED_NODE_SNAPSHOT_TYPE, null);
+                            for (let i = 0; i < r.snapshotLength; i++) {
+                                const node = r.snapshotItem(i);
+                                if (isVisible(node)) { el = node; break; }
+                            }
                         } else {
-                            el = document.querySelector(sel);
+                            const nodes = document.querySelectorAll(sel);
+                            for (const node of nodes) {
+                                if (isVisible(node)) { el = node; break; }
+                            }
                         }
                         return el?.tagName === 'SELECT';
                     } catch(e) { return false; }
@@ -220,6 +238,7 @@ async def cmd_click(params: dict, session: Session):
     fail_on_error  = bool(params.get("fail_on_error", True))
 
     async with session.lock:
+        _t0 = time.monotonic()
         await session.page.evaluate("() => { const p=document.getElementById('__amethyst_pin'); if(p) p.remove(); }")
         try:
             await session.page.wait_for_load_state("domcontentloaded", timeout=10000)
@@ -233,8 +252,29 @@ async def cmd_click(params: dict, session: Session):
         is_hidden_option = await session.page.evaluate("""
             (sel) => {
                 try {
-                    const r = document.evaluate(sel, document, null, XPathResult.FIRST_ORDERED_NODE_TYPE, null);
-                    const el = r.singleNodeValue || document.querySelector(sel);
+                    function isSelectVisible(node) {
+                        const s = node.closest('select');
+                        if (!s) return false;
+                        const style = window.getComputedStyle(s);
+                        return s.offsetParent !== null && style.display !== 'none' && style.visibility !== 'hidden';
+                    }
+                    let el = null;
+                    if (sel.startsWith('//')) {
+                        const r = document.evaluate(sel, document, null, XPathResult.ORDERED_NODE_SNAPSHOT_TYPE, null);
+                        if (r.snapshotLength > 1) console.warn('[cmd_click] is_hidden_option: ' + r.snapshotLength + ' <option> candidates for: ' + sel);
+                        for (let i = 0; i < r.snapshotLength; i++) {
+                            const node = r.snapshotItem(i);
+                            if (node.tagName === 'OPTION' && isSelectVisible(node)) { el = node; break; }
+                        }
+                        if (!el && r.snapshotLength > 0) { console.warn('[cmd_click] is_hidden_option: no visible-parent candidate, falling back to first match for: ' + sel); el = r.snapshotItem(0); }
+                    } else {
+                        const nodes = document.querySelectorAll(sel);
+                        if (nodes.length > 1) console.warn('[cmd_click] is_hidden_option: ' + nodes.length + ' <option> candidates for: ' + sel);
+                        for (const node of nodes) {
+                            if (node.tagName === 'OPTION' && isSelectVisible(node)) { el = node; break; }
+                        }
+                        if (!el && nodes.length > 0) { console.warn('[cmd_click] is_hidden_option: no visible-parent candidate, falling back to first match for: ' + sel); el = nodes[0]; }
+                    }
                     return el ? el.tagName === 'OPTION' : false;
                 } catch(e) { return false; }
             }
@@ -244,8 +284,27 @@ async def cmd_click(params: dict, session: Session):
             option_text = await session.page.evaluate("""
                 (sel) => {
                     try {
-                        const r = document.evaluate(sel, document, null, XPathResult.FIRST_ORDERED_NODE_TYPE, null);
-                        const el = r.singleNodeValue;
+                        function isSelectVisible(node) {
+                            const s = node.closest('select');
+                            if (!s) return false;
+                            const style = window.getComputedStyle(s);
+                            return s.offsetParent !== null && style.display !== 'none' && style.visibility !== 'hidden';
+                        }
+                        let el = null;
+                        if (sel.startsWith('//')) {
+                            const r = document.evaluate(sel, document, null, XPathResult.ORDERED_NODE_SNAPSHOT_TYPE, null);
+                            for (let i = 0; i < r.snapshotLength; i++) {
+                                const node = r.snapshotItem(i);
+                                if (node.tagName === 'OPTION' && isSelectVisible(node)) { el = node; break; }
+                            }
+                            if (!el && r.snapshotLength > 0) { console.warn('[cmd_click] option_text: no visible-parent candidate, falling back to first match for: ' + sel); el = r.snapshotItem(0); }
+                        } else {
+                            const nodes = document.querySelectorAll(sel);
+                            for (const node of nodes) {
+                                if (node.tagName === 'OPTION' && isSelectVisible(node)) { el = node; break; }
+                            }
+                            if (!el && nodes.length > 0) { console.warn('[cmd_click] option_text: no visible-parent candidate, falling back to first match for: ' + sel); el = nodes[0]; }
+                        }
                         return el ? el.textContent.trim() : '';
                     } catch(e) { return ''; }
                 }
@@ -271,6 +330,8 @@ async def cmd_click(params: dict, session: Session):
         result = await _force_action(session.page, sel, "click")
         success = bool(result)
         resolved = result.get("resolved") if isinstance(result, dict) else None
+        if capture_toast:
+            print(f"[TOAST TIMING] click returned at t={time.monotonic()-_t0:.2f}s")
 
         if success:
             await asyncio.sleep(0.5)
@@ -285,12 +346,15 @@ async def cmd_click(params: dict, session: Session):
                     "Use get_interactable_elements to verify the selector."
                 ) from e
 
-        try:
-            await session.page.wait_for_load_state("load", timeout=10000)
-        except Exception:
-            pass
-
+        # ── Toast capture: race against the FULL window immediately after click. ──
+        # No "load" wait inserted here — for SPA actions (no real navigation),
+        # the browser "load" event may have already fired on initial page load
+        # and resolves instantly, telling us nothing about whether the async
+        # action (API call → toast render) has completed. Racing immediately
+        # with the full toast_timeout avoids burning the toast's visible window
+        # on a wait that doesn't correspond to the actual async operation.
         if capture_toast:
+            print(f"[TOAST TIMING] entering toast capture block at t={time.monotonic()-_t0:.2f}s")
             info = None
             if toast_selector:
                 try:
@@ -300,15 +364,17 @@ async def cmd_click(params: dict, session: Session):
                 except Exception:
                     info = None
             else:
-                info = await session.page.evaluate(_RACE_JS, 1500)
-                if info is None:
-                    await session.page.evaluate(_ARM_JS)
-                    remaining = max(toast_timeout - 1500, 1000)
-                    info = await session.page.evaluate(_RACE_JS, remaining)
+                print(f"[TOAST TIMING] starting race (timeout={toast_timeout}ms) at t={time.monotonic()-_t0:.2f}s")
+                info = await session.page.evaluate(_RACE_JS, toast_timeout)
+                print(f"[TOAST TIMING] race resolved at t={time.monotonic()-_t0:.2f}s, info={info}")
 
             toast_found = info is not None
             toast_type  = info["type"] if toast_found else "none"
             toast_text  = info["text"] if toast_found else ""
+            toast_type  = resolve_toast_type(toast_type, toast_text)
+
+            if toast_found:
+                await asyncio.sleep(0.3)  # let CSS fade-in transition settle before screenshot
 
             if expected_text:
                 passed = expected_text.lower() in toast_text.lower()
@@ -321,16 +387,25 @@ async def cmd_click(params: dict, session: Session):
                 raise AssertionError(f"Step failed — toast_type={toast_type!r}, text={toast_text!r}")
 
             try:
+                await session.page.wait_for_load_state("load", timeout=5000)
+            except Exception:
+                pass
+            try:
                 await session.page.wait_for_load_state("networkidle", timeout=8000)
             except Exception:
                 pass
 
+            print(f"[TOAST TIMING] about to return at t={time.monotonic()-_t0:.2f}s")
             return {
                 "selector": sel, "resolved_selector": resolved,
                 "toast_found": toast_found, "toast_type": toast_type,
                 "toast_text": toast_text, "passed": passed,
             }
 
+        try:
+            await session.page.wait_for_load_state("load", timeout=10000)
+        except Exception:
+            pass
         try:
             await session.page.wait_for_load_state("networkidle", timeout=8000)
         except Exception:
@@ -773,6 +848,7 @@ async def cmd_press_key(params: dict, session: Session):
     key = params.get("key", "Escape")
     async with session.lock:
         await session.page.keyboard.press(key)
+        await asyncio.sleep(0.4)  
     return {"key": key}
 
 
@@ -986,12 +1062,27 @@ async def cmd_assert_disabled(params: dict, session: Session):
 
 @register_tool(
     "assert_url",
-    "Assert that the current page URL contains the expected substring.",
-    {"type": "object", "properties": {"expected": {"type": "string"}}, "required": ["expected"]}
+    "Assert that the current page URL contains the expected substring. Waits for navigation if needed.",
+    {
+        "type": "object",
+        "properties": {
+            "expected": {"type": "string"},
+            "timeout": {"type": "integer"},
+        },
+        "required": ["expected"]
+    }
 )
 async def cmd_assert_url(params: dict, session: Session):
     expected = params["expected"]
-    url = session.page.url
+    timeout = int(params.get("timeout", 8000))
+
+    async with session.lock:
+        try:
+            await session.page.wait_for_url(f"**/*{expected}*", timeout=timeout)
+        except Exception:
+            pass  # fall through to final check below for a clean error message
+        url = session.page.url
+
     if expected not in url:
         raise AssertionError(f"assert_url failed — expected {expected!r} in URL, got: {url!r}")
     return {"expected": expected, "actual": url, "passed": True}
@@ -1044,6 +1135,7 @@ async def cmd_assert_toast(params: dict, session: Session):
     toast_found = info is not None
     toast_type  = info["type"] if toast_found else "none"
     toast_text  = info["text"] if toast_found else ""
+    toast_type  = resolve_toast_type(toast_type, toast_text)
 
     if expected_text:
         passed = expected_text.lower() in toast_text.lower()

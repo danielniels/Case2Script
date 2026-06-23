@@ -145,9 +145,9 @@ export default function RunDetailPage() {
   }
 
   return (
-    <div className="p-6 space-y-4">
+    <div id="run-detail-page" className="p-6 space-y-4">
       {/* Header */}
-      <div className="flex items-start justify-between gap-4">
+      <div id="run-detail-header" className="flex items-start justify-between gap-4">
         <div className="space-y-1">
           <h1 className="text-xl font-semibold text-white">Run Detail</h1>
           <p className="text-xs text-gray-500 font-mono">{runId}</p>
@@ -156,8 +156,9 @@ export default function RunDetailPage() {
           )}
         </div>
         <div className="flex items-center gap-3 flex-shrink-0">
-          {meta && <StatusBadge status={meta.status} />}
+          {meta && <StatusBadge id="run-detail-status-badge" status={meta.status} />}
           <button
+            id="run-detail-back-btn"
             onClick={() => navigate('/')}
             className="text-xs text-indigo-400 hover:text-indigo-300 transition-colors"
           >
@@ -167,7 +168,7 @@ export default function RunDetailPage() {
       </div>
 
       {/* Stats row */}
-      <div className="flex gap-4 text-xs text-gray-500">
+      <div id="run-detail-stats" className="flex gap-4 text-xs text-gray-500">
         {meta && (
           <>
             <span>Total: <span className="text-gray-300">{meta.total_steps || stepsArray.length} steps</span></span>
@@ -185,6 +186,7 @@ export default function RunDetailPage() {
         <div className="flex gap-2">
           {meta.script_path && (
             <a
+              id="run-detail-script-download"
               href={scriptDownloadUrl(meta.script_path)}
               download
               className="flex items-center gap-1.5 px-3 py-1.5 bg-gray-800 hover:bg-gray-700 rounded-lg text-xs text-gray-300 transition-colors"
@@ -197,6 +199,7 @@ export default function RunDetailPage() {
           )}
           {meta.report_path && (
             <a
+              id="run-detail-report-download"
               href={reportViewUrl(meta.report_path)}
               download
               className="flex items-center gap-1.5 px-3 py-1.5 bg-gray-800 hover:bg-gray-700 rounded-lg text-xs text-gray-300 transition-colors"
@@ -211,7 +214,7 @@ export default function RunDetailPage() {
       )}
 
       {/* Step table */}
-      <div className="bg-gray-900 rounded-xl border border-gray-800 overflow-hidden">
+      <div id="run-detail-steps-table" className="bg-gray-900 rounded-xl border border-gray-800 overflow-hidden">
         <table className="w-full text-sm table-fixed">
           <colgroup>
             <col className="w-10" />
@@ -284,6 +287,7 @@ export default function RunDetailPage() {
       {/* Lightbox */}
       {lightbox && (
         <div
+          id="lightbox"
           className="fixed inset-0 bg-black/85 flex items-center justify-center z-50 p-6"
           onClick={() => setLightbox(null)}
         >

@@ -160,6 +160,30 @@ async def execute_step(body: dict, request: Request) -> dict:
             params = {"sessionId": sid}
             log(sid, f"[OVERRIDE] Step '{step_desc}' forced method → '{method}'")
 
+        # ── Toast-capture override: force capture_toast=True for known toast-producing clicks ──
+        # Purpose: eliminate the gap between click and toast detection by arming the
+        # toast-capture JS (_ARM_JS/_RACE_JS in tools.py) INSIDE cmd_click itself,
+        # rather than relying on a separate step that may run after the toast has
+        # already auto-dismissed.
+        _TOAST_CAPTURE_TRIGGERS = (
+            "login button",
+            "submit",
+            "simpan",
+            "save",
+            "delete",
+            "hapus",
+            "create",
+            "tambah",
+            "push to isgs",
+            "approve",
+            "reject",
+        )
+        if method == "click" and any(trigger in _step_desc_lower for trigger in _TOAST_CAPTURE_TRIGGERS):
+            params["capture_toast"] = True
+            params["require_toast"] = False   # don't fail the step if no toast appears — best-effort capture, not assertion
+            params["fail_on_error"] = False    # same reasoning — capture only, not validation
+            log(sid, f"[TOAST CAPTURE] Step '{step_desc}' → arming toast capture before click")
+
         # ── smart_fix rules ──
         mcp_json = smart_fix_llm_output({"method": method, "params": params}, step_desc)
         method = mcp_json.get("method", method)

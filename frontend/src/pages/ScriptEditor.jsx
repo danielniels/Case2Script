@@ -47,9 +47,9 @@ export default function ScriptEditor() {
   }
 
   return (
-    <div className="space-y-4">
+    <div id="script-editor-page" className="space-y-4">
       <div className="flex items-center gap-4">
-        <button onClick={() => navigate(-1)} className="text-indigo-400 text-sm underline">← Back</button>
+        <button id="script-back-btn" onClick={() => navigate(-1)} className="text-indigo-400 text-sm underline">← Back</button>
         <h1 className="text-xl font-bold font-mono truncate">{decoded.split('/').pop()}</h1>
         {edited && (
           <span className="text-xs bg-yellow-700 text-yellow-100 px-2 py-0.5 rounded">
@@ -62,6 +62,7 @@ export default function ScriptEditor() {
         <p className="text-gray-400">Loading…</p>
       ) : (
         <textarea
+          id="script-code-textarea"
           className="w-full h-[70vh] bg-gray-900 text-green-300 font-mono text-xs rounded p-3 resize-none border border-gray-700 focus:outline-none focus:border-indigo-500"
           value={code}
           onChange={handleChange}
@@ -71,6 +72,7 @@ export default function ScriptEditor() {
 
       <div className="flex gap-3">
         <button
+          id="script-save-btn"
           disabled={saving || loading}
           onClick={handleSave}
           className="bg-indigo-600 hover:bg-indigo-500 disabled:opacity-50 px-4 py-2 rounded text-sm"
@@ -78,6 +80,7 @@ export default function ScriptEditor() {
           {saving ? 'Saving…' : saved ? 'Saved ✓' : 'Save'}
         </button>
         <a
+          id="script-download-link"
           href={`/api/scripts/download?path=${encodeURIComponent(decoded)}`}
           className="bg-gray-700 hover:bg-gray-600 px-4 py-2 rounded text-sm"
         >

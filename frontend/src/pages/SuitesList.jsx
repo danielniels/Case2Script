@@ -98,23 +98,25 @@ export default function SuitesList() {
   }
 
   return (
-    <div className="space-y-6">
+    <div id="suites-page" className="space-y-6">
       <h1 className="text-2xl font-bold">Test Suites</h1>
 
       {/* Import panel */}
-      <div className="bg-gray-800 rounded-lg p-4 space-y-4">
+      <div id="import-panel" className="bg-gray-800 rounded-lg p-4 space-y-4">
         <h2 className="font-semibold text-lg">Import Suite</h2>
 
         {/* JSON */}
         <div className="space-y-2">
           <label className="text-sm text-gray-400">Paste JSON suite</label>
           <textarea
+            id="json-suite-textarea"
             className="w-full h-32 bg-gray-900 rounded p-2 text-sm font-mono text-green-400 resize-y"
             placeholder='{"id": "...", "test_cases": [...]}'
             value={jsonInput}
             onChange={e => setJsonInput(e.target.value)}
           />
           <button
+            id="import-json-btn"
             disabled={importing || !jsonInput}
             onClick={handleJsonImport}
             className="bg-indigo-600 hover:bg-indigo-500 disabled:opacity-50 px-4 py-1.5 rounded text-sm"
@@ -126,8 +128,8 @@ export default function SuitesList() {
         {/* Excel */}
         <div className="flex items-center gap-3">
           <label className="text-sm text-gray-400">Upload Excel</label>
-          <input type="file" accept=".xlsx,.xls" onChange={handleExcelImport} className="text-sm" />
-          <a href={converters.excelTemplate()} className="text-indigo-400 text-sm underline">
+          <input id="excel-upload-input" type="file" accept=".xlsx,.xls" onChange={handleExcelImport} className="text-sm" />
+          <a id="excel-template-link" href={converters.excelTemplate()} className="text-indigo-400 text-sm underline">
             Download template
           </a>
         </div>
@@ -136,12 +138,14 @@ export default function SuitesList() {
         <div className="space-y-2">
           <label className="text-sm text-gray-400">Generate from prompt (Ollama)</label>
           <textarea
+            id="prompt-textarea"
             className="w-full h-20 bg-gray-900 rounded p-2 text-sm resize-y"
             placeholder="Describe the test scenario in plain text…"
             value={promptText}
             onChange={e => setPromptText(e.target.value)}
           />
           <button
+            id="generate-ai-btn"
             disabled={importing || !promptText.trim()}
             onClick={handlePromptImport}
             className="bg-purple-700 hover:bg-purple-600 disabled:opacity-50 px-4 py-1.5 rounded text-sm"
@@ -157,9 +161,9 @@ export default function SuitesList() {
       {!loading && list.length === 0 && (
         <p className="text-gray-400">No suites yet. Import one above.</p>
       )}
-      <div className="space-y-3">
+      <div id="suites-list" className="space-y-3">
         {list.map(s => (
-          <div key={s.id} className="bg-gray-800 rounded-lg p-4 flex items-center justify-between">
+          <div key={s.id} id={`suite-${s.id}`} className="bg-gray-800 rounded-lg p-4 flex items-center justify-between">
             <div>
               <p className="font-medium">{s.name}</p>
               <p className="text-sm text-gray-400">
@@ -169,6 +173,7 @@ export default function SuitesList() {
             </div>
             <div className="flex gap-2">
               <button
+                id={`suite-run-btn-${s.id}`}
                 disabled={runningId === s.id}
                 onClick={() => handleRunSuite(s)}
                 className="bg-green-700 hover:bg-green-600 disabled:opacity-50 px-3 py-1.5 rounded text-sm"
@@ -176,6 +181,7 @@ export default function SuitesList() {
                 {runningId === s.id ? 'Starting…' : 'Run'}
               </button>
               <button
+                id={`suite-delete-btn-${s.id}`}
                 onClick={() => handleDelete(s.id)}
                 className="bg-red-800 hover:bg-red-700 px-3 py-1.5 rounded text-sm"
               >

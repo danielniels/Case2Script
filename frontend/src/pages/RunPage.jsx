@@ -72,9 +72,13 @@ export default function RunPage() {
   const [runStatus, setRunStatus] = useState(null)
   const [allSteps, setAllSteps] = useState([])
   const [latestScreenshot, setLatestScreenshot] = useState(null)
+  const [startTime, setStartTime] = useState(null)
+  const [elapsed, setElapsed] = useState(0)
+  const [finalDuration, setFinalDuration] = useState(null)
 
   const esRef = useRef(null)
   const pollRef = useRef(null)
+  const timerRef = useRef(null)
   const stepMapRef = useRef({})
   const allStepsRef = useRef([])
 
@@ -82,6 +86,21 @@ export default function RunPage() {
 
   // Keep allStepsRef in sync so SSE handler can use the latest value
   useEffect(() => { allStepsRef.current = allSteps }, [allSteps])
+
+  // Elapsed timer — tick every second while running, freeze on finish
+  useEffect(() => {
+    if (isRunning && startTime) {
+      timerRef.current = setInterval(() => {
+        setElapsed(Math.floor((Date.now() - startTime) / 1000))
+      }, 1000)
+    } else {
+      clearInterval(timerRef.current)
+      if (startTime && !isRunning && runStatus) {
+        setFinalDuration(elapsed)
+      }
+    }
+    return () => clearInterval(timerRef.current)
+  }, [isRunning, startTime])
 
   // SSE subscription for step-level events
   useEffect(() => {
@@ -173,6 +192,9 @@ export default function RunPage() {
 
     setIsStarting(true)
     setLatestScreenshot(null)
+    setStartTime(Date.now())
+    setElapsed(0)
+    setFinalDuration(null)
     stepMapRef.current = {}
 
     const initialSteps = parsed.steps.map(s => ({
@@ -213,6 +235,12 @@ export default function RunPage() {
     }
   }
 
+  const fmtDuration = (secs) => {
+    const m = Math.floor(secs / 60)
+    const s = secs % 60
+    return m > 0 ? `${m}m ${s}s` : `${s}s`
+  }
+
   const completedCount = allSteps.filter(s => s.status === 'passed' || s.status === 'failed').length
   const totalCount = allSteps.length
   const progress = totalCount > 0 ? (completedCount / totalCount) * 100 : 0
@@ -225,17 +253,28 @@ export default function RunPage() {
     'bg-gray-600 text-white'
 
   return (
-    <div className="p-6 space-y-4">
+    <div id="run-page" className="p-6 space-y-4">
       {/* Header */}
-      <div className="flex items-center justify-between">
+      <div id="run-header" className="flex items-center justify-between">
         <h1 className="text-xl font-semibold text-white">Run Test</h1>
         {runStatus && (
           <div className="flex items-center gap-3">
-            <span className="text-xs text-gray-500 font-mono">{runId}</span>
-            <span className={`text-xs font-bold px-2.5 py-1 rounded-full ${statusBadge}`}>
+            <span id="run-id-display" className="text-xs text-gray-500 font-mono">{runId}</span>
+            <span id="run-status-badge" className={`text-xs font-bold px-2.5 py-1 rounded-full ${statusBadge}`}>
               {runStatus.status?.toUpperCase()}
             </span>
+            {startTime && (
+              <span id="run-timer" className="text-xs text-gray-500 font-mono">
+                {new Date(startTime).toLocaleTimeString()}
+                {' · '}
+                {isRunning
+                  ? <span className="text-blue-400">{fmtDuration(elapsed)}</span>
+                  : <span className="text-gray-400">{fmtDuration(finalDuration ?? elapsed)}</span>
+                }
+              </span>
+            )}
             <button
+              id="view-detail-btn"
               onClick={() => navigate(`/runs/${runId}`)}
               className="text-xs text-indigo-400 hover:text-indigo-300 underline"
             >
@@ -246,12 +285,13 @@ export default function RunPage() {
       </div>
 
       {/* Blok 1 — JSON Input */}
-      <div className="bg-gray-900 rounded-xl border border-gray-800 p-4 space-y-3">
+      <div id="json-input-panel" className="bg-gray-900 rounded-xl border border-gray-800 p-4 space-y-3">
         <h2 className="text-sm font-semibold text-gray-300 flex items-center gap-2">
           <span className="w-5 h-5 rounded-full bg-indigo-600 flex items-center justify-center text-xs text-white font-bold flex-shrink-0">1</span>
           Test Case JSON
         </h2>
         <textarea
+          id="json-textarea"
           className="w-full h-40 bg-gray-950 border border-gray-700 rounded-lg p-3 text-sm font-mono text-green-400 resize-y focus:outline-none focus:border-indigo-500 transition-colors"
           placeholder={PLACEHOLDER}
           value={jsonInput}
@@ -259,9 +299,10 @@ export default function RunPage() {
           disabled={isRunning}
           spellCheck={false}
         />
-        {parseError && <p className="text-red-400 text-xs">{parseError}</p>}
+        {parseError && <p id="json-parse-error" className="text-red-400 text-xs">{parseError}</p>}
         <div className="flex gap-2">
           <button
+            id="run-btn"
             onClick={handleStart}
             disabled={isStarting || isRunning || !jsonInput.trim()}
             className="px-4 py-2 bg-indigo-600 hover:bg-indigo-500 disabled:opacity-40 disabled:cursor-not-allowed text-white text-sm font-medium rounded-lg transition-colors"
@@ -270,6 +311,7 @@ export default function RunPage() {
           </button>
           {isRunning && (
             <button
+              id="stop-btn"
               onClick={handleStop}
               className="px-4 py-2 bg-red-700 hover:bg-red-600 text-white text-sm font-medium rounded-lg transition-colors"
             >
@@ -283,27 +325,28 @@ export default function RunPage() {
       <div className="grid grid-cols-5 gap-4">
 
         {/* Blok 2 — Live Steps */}
-        <div className="col-span-3 bg-gray-900 rounded-xl border border-gray-800 p-4 space-y-3">
+        <div id="live-steps-panel" className="col-span-3 bg-gray-900 rounded-xl border border-gray-800 p-4 space-y-3">
           <div className="flex items-center justify-between">
             <h2 className="text-sm font-semibold text-gray-300 flex items-center gap-2">
               <span className="w-5 h-5 rounded-full bg-indigo-600 flex items-center justify-center text-xs text-white font-bold flex-shrink-0">2</span>
               Live Steps
             </h2>
             {totalCount > 0 && (
-              <span className="text-xs text-gray-500">{completedCount} / {totalCount}</span>
+              <span id="steps-counter" className="text-xs text-gray-500">{completedCount} / {totalCount}</span>
             )}
           </div>
 
           {totalCount > 0 && (
-            <div className="bg-gray-800 rounded-full h-1.5 overflow-hidden">
+            <div id="steps-progress-bar" className="bg-gray-800 rounded-full h-1.5 overflow-hidden">
               <div
+                id="steps-progress-fill"
                 className="bg-indigo-500 h-1.5 transition-all duration-500"
                 style={{ width: `${progress}%` }}
               />
             </div>
           )}
 
-          <div className="space-y-0.5 max-h-80 overflow-y-auto">
+          <div id="steps-list" className="space-y-0.5 max-h-80 overflow-y-auto">
             {allSteps.length === 0 ? (
               <p className="text-gray-600 text-sm text-center py-10">
                 Paste a test case JSON and click Run Test
@@ -317,14 +360,14 @@ export default function RunPage() {
         </div>
 
         {/* Blok 3 — Screenshot + Downloads */}
-        <div className="col-span-2 bg-gray-900 rounded-xl border border-gray-800 p-4 space-y-3 flex flex-col">
+        <div id="results-panel" className="col-span-2 bg-gray-900 rounded-xl border border-gray-800 p-4 space-y-3 flex flex-col">
           <h2 className="text-sm font-semibold text-gray-300 flex items-center gap-2">
             <span className="w-5 h-5 rounded-full bg-indigo-600 flex items-center justify-center text-xs text-white font-bold flex-shrink-0">3</span>
             Results
           </h2>
 
           {/* Screenshot preview */}
-          <div className="bg-gray-950 rounded-lg overflow-hidden border border-gray-800 flex items-center justify-center" style={{ aspectRatio: '16/9' }}>
+          <div id="screenshot-preview" className="bg-gray-950 rounded-lg overflow-hidden border border-gray-800 flex items-center justify-center" style={{ aspectRatio: '16/9' }}>
             {latestScreenshot ? (
               <img
                 src={screenshotUrl(latestScreenshot)}
@@ -338,9 +381,10 @@ export default function RunPage() {
           </div>
 
           {/* Download buttons */}
-          <div className="space-y-2 flex-1">
+          <div id="download-buttons" className="space-y-2 flex-1">
             {runStatus?.script_path ? (
               <a
+                id="download-script-btn"
                 href={scriptDownloadUrl(runStatus.script_path)}
                 download
                 className="flex items-center gap-2.5 w-full px-3 py-2.5 bg-gray-800 hover:bg-gray-700 rounded-lg text-xs text-gray-300 transition-colors"
@@ -361,6 +405,7 @@ export default function RunPage() {
 
             {runStatus?.report_path ? (
               <a
+                id="download-report-btn"
                 href={reportViewUrl(runStatus.report_path)}
                 download
                 className="flex items-center gap-2.5 w-full px-3 py-2.5 bg-gray-800 hover:bg-gray-700 rounded-lg text-xs text-gray-300 transition-colors"
