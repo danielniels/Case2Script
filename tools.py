@@ -16,6 +16,7 @@ from typing import Any, Callable, Dict, Optional
 import pandas as pd
 from bs4 import BeautifulSoup
 from fastapi import Request
+from playwright.async_api import Error as PlaywrightError, TimeoutError as PlaywrightTimeoutError
 
 from credentials import get_credential_async
 from helpers import (
@@ -373,24 +374,30 @@ async def cmd_click(params: dict, session: Session):
         except Exception:
             pass
 
-        result = await _force_action(session.page, sel, "click")
-        success = bool(result)
-        resolved = result.get("resolved") if isinstance(result, dict) else None
+        loc = await _find_locator(session.page, sel)
+        try:
+            await loc.click(timeout=8000)
+            success = True
+            resolved = None
+        except (PlaywrightTimeoutError, PlaywrightError):
+            # Native actionability check failed — fall back to JS force-click.
+            # Known limitation: _force_action's isVisible() does not check disabled
+            # state or pointer-events, so a disabled-but-rendered element can
+            # false-pass here. That is a pre-existing issue, out of scope for this change.
+            result = await _force_action(session.page, sel, "click")
+            success = bool(result)
+            resolved = result.get("resolved") if isinstance(result, dict) else None
+            if not success:
+                raise ValueError(
+                    f"Element not found or not clickable: {sel!r}. "
+                    "Use get_interactable_elements to verify the selector."
+                )
+
         if capture_toast:
             print(f"[TOAST TIMING] click returned at t={time.monotonic()-_t0:.2f}s")
 
         if success:
             await asyncio.sleep(0.5)
-        else:
-            loc = await _find_locator(session.page, sel)
-            try:
-                await loc.wait_for(state="visible", timeout=30000)
-                await loc.click()
-            except Exception as e:
-                raise ValueError(
-                    f"Element not found or not clickable after 30s: {sel!r}. "
-                    "Use get_interactable_elements to verify the selector."
-                ) from e
 
         # ── Toast capture: race against the FULL window immediately after click. ──
         # No "load" wait inserted here — for SPA actions (no real navigation),
