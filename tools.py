@@ -29,6 +29,52 @@ from helpers import (
 from stores import Session
 
 
+# ==================== Upload fixtures helpers ====================
+
+FIXTURES_DIR = Path("data/fixtures")
+
+
+def _resolve_fixtures(files: list[str]) -> list[str]:
+    """Relative paths resolve into data/fixtures/. Absolute paths pass through.
+    Raises FileNotFoundError with a clear message if the file is missing —
+    so portability breaks loudly, not as an opaque Playwright timeout."""
+    resolved = []
+    for f in files:
+        p = Path(f)
+        if not p.is_absolute():
+            p = FIXTURES_DIR / f
+        if not p.exists():
+            raise FileNotFoundError(f"upload file not found: {p} (cwd={Path.cwd()})")
+        resolved.append(str(p.resolve()))
+    return resolved
+
+
+async def _verify_uploaded_filename(page, basenames: list[str], timeout: int = 5000) -> bool:
+    """Confirm each filename actually landed. Two strategies:
+    1. Read input.files[].name across all file inputs (works for direct/nested input).
+    2. Fallback: poll the DOM text for the basename (the filename 'chip' a dropzone renders).
+    """
+    wanted = [Path(b).name for b in basenames]
+
+    in_inputs = await page.evaluate("""() => {
+        const names = [];
+        for (const inp of document.querySelectorAll('input[type=file]')) {
+            if (inp.files) for (const f of inp.files) names.push(f.name);
+        }
+        return names;
+    }""")
+    if all(any(w == n or w in n for n in in_inputs) for w in wanted) and in_inputs:
+        return True
+
+    deadline = asyncio.get_event_loop().time() + (timeout / 1000)
+    while asyncio.get_event_loop().time() < deadline:
+        body_txt = (await page.evaluate("() => document.body.innerText || ''")) or ""
+        if all(w in body_txt for w in wanted):
+            return True
+        await asyncio.sleep(0.25)
+    return False
+
+
 # ==================== Tool Registry ====================
 
 TOOL_REGISTRY: Dict[str, Dict[str, Any]] = {}
@@ -356,17 +402,57 @@ async def cmd_click(params: dict, session: Session):
         if capture_toast:
             print(f"[TOAST TIMING] entering toast capture block at t={time.monotonic()-_t0:.2f}s")
             info = None
+            navigated_away = False
+
+            def _is_nav_destroyed_error(exc: Exception) -> bool:
+                msg = str(exc)
+                return (
+                    "Execution context was destroyed" in msg
+                    or "Target page" in msg
+                    or "Target closed" in msg
+                )
+
             if toast_selector:
                 try:
                     await session.page.wait_for_selector(toast_selector, state="visible", timeout=toast_timeout)
                     await session.page.evaluate(_FREEZE_JS, toast_selector)
                     info = await session.page.evaluate(_CLASSIFY_JS, toast_selector)
-                except Exception:
+                except Exception as e:
+                    if _is_nav_destroyed_error(e):
+                        navigated_away = True
+                        print(f"[TOAST TIMING] toast_selector race interrupted by navigation at t={time.monotonic()-_t0:.2f}s")
                     info = None
             else:
                 print(f"[TOAST TIMING] starting race (timeout={toast_timeout}ms) at t={time.monotonic()-_t0:.2f}s")
-                info = await session.page.evaluate(_RACE_JS, toast_timeout)
-                print(f"[TOAST TIMING] race resolved at t={time.monotonic()-_t0:.2f}s, info={info}")
+                try:
+                    info = await session.page.evaluate(_RACE_JS, toast_timeout)
+                    print(f"[TOAST TIMING] race resolved at t={time.monotonic()-_t0:.2f}s, info={info}")
+                except Exception as e:
+                    if _is_nav_destroyed_error(e):
+                        navigated_away = True
+                        print(f"[TOAST TIMING] race interrupted by navigation at t={time.monotonic()-_t0:.2f}s")
+                    info = None
+
+            if navigated_away:
+                # The click triggered a real page navigation while the toast race
+                # was still running. The click itself already succeeded (it's what
+                # caused the navigation) — don't fail the step over a toast we no
+                # longer have a page to look for. Report success, no toast info.
+                try:
+                    await session.page.wait_for_load_state("load", timeout=10000)
+                except Exception:
+                    pass
+                try:
+                    await session.page.wait_for_load_state("networkidle", timeout=8000)
+                except Exception:
+                    pass
+                print(f"[TOAST TIMING] returning success (navigated away) at t={time.monotonic()-_t0:.2f}s")
+                return {
+                    "selector": sel, "resolved_selector": resolved,
+                    "toast_found": False, "toast_type": "navigated",
+                    "toast_text": "", "passed": True,
+                    "note": "page navigated before toast capture completed — click likely succeeded",
+                }
 
             toast_found = info is not None
             toast_type  = info["type"] if toast_found else "none"
@@ -1075,14 +1161,11 @@ async def cmd_assert_disabled(params: dict, session: Session):
 async def cmd_assert_url(params: dict, session: Session):
     expected = params["expected"]
     timeout = int(params.get("timeout", 8000))
-
-    async with session.lock:
-        try:
-            await session.page.wait_for_url(f"**/*{expected}*", timeout=timeout)
-        except Exception:
-            pass  # fall through to final check below for a clean error message
-        url = session.page.url
-
+    try:
+        await session.page.wait_for_url(f"**/*{expected}*", timeout=timeout)
+    except Exception:
+        pass  # fall through to final check below for the exact error message
+    url = session.page.url
     if expected not in url:
         raise AssertionError(f"assert_url failed — expected {expected!r} in URL, got: {url!r}")
     return {"expected": expected, "actual": url, "passed": True}
@@ -1160,13 +1243,17 @@ async def cmd_assert_toast(params: dict, session: Session):
 
 @register_tool(
     "upload_file",
-    "Set one or more files on a file-input element.",
+    "Upload one or more files. Auto-detects the upload mechanism: (1) target IS a file input → set directly; "
+    "(2) target is a dropzone/container wrapping a hidden file input → set on that input; "
+    "(3) clicking the target opens a file chooser → intercept it. "
+    "Relative file paths resolve into data/fixtures/. Verifies the filename landed after upload.",
     {
         "type": "object",
         "properties": {
             "selector": {"type": "string"},
             "files": {"type": ["string", "array"], "items": {"type": "string"}},
             "timeout": {"type": "integer"},
+            "verify_filename": {"type": "boolean", "description": "Assert the uploaded filename appears after upload (default true)."},
         },
         "required": ["selector", "files"]
     }
@@ -1176,10 +1263,70 @@ async def cmd_upload_file(params: dict, session: Session):
     files = params["files"]
     if isinstance(files, str):
         files = [files]
+    resolved = _resolve_fixtures(files)
+    timeout = int(params.get("timeout", 10000))
+    verify = params.get("verify_filename", True)
+
+    _DETECT_JS = """(sel) => {
+        let el;
+        try {
+            if (sel.startsWith('//') || sel.startsWith('xpath=')) {
+                el = document.evaluate(sel.replace('xpath=',''), document, null,
+                     XPathResult.FIRST_ORDERED_NODE_TYPE, null).singleNodeValue;
+            } else {
+                el = document.querySelector(sel.replace('css=',''));
+            }
+        } catch(e) { return {found:false}; }
+        if (!el) return {found:false};
+        if (el.tagName === 'INPUT' && el.type === 'file') return {found:true, isInput:true};
+        let inp = el.querySelector('input[type=file]');
+        if (!inp && el.closest) inp = el.closest('form, div, section')?.querySelector('input[type=file]');
+        if (inp) {
+            inp.setAttribute('data-amethyst-upload','1');
+            inp.removeAttribute('hidden'); inp.style.display='block'; inp.style.visibility='visible';
+            return {found:true, isInput:false, hasNested:true};
+        }
+        return {found:true, isInput:false, hasNested:false};
+    }"""
+
     async with session.lock:
-        loc = await _find_locator(session.page, sel)
-        await loc.set_input_files(files, timeout=params.get("timeout", 10000))
-    return {"selector": sel, "files": files, "uploaded": True}
+        det = await session.page.evaluate(_DETECT_JS, sel)
+
+        if det.get("isInput"):
+            loc = await _find_locator(session.page, sel)
+            await loc.set_input_files(resolved, timeout=timeout)
+            method = "direct"
+
+        elif det.get("hasNested"):
+            inp_loc = session.page.locator('[data-amethyst-upload="1"]')
+            try:
+                await inp_loc.set_input_files(resolved, timeout=timeout)
+            finally:
+                await session.page.evaluate(
+                    "() => document.querySelector('[data-amethyst-upload=\\'1\\']')?.removeAttribute('data-amethyst-upload')"
+                )
+            method = "nested_input"
+
+        else:
+            async with session.page.expect_file_chooser(timeout=timeout) as fc_info:
+                loc = await _find_locator(session.page, sel)
+                await loc.click(timeout=timeout)
+            chooser = await fc_info.value
+            await chooser.set_files(resolved, timeout=timeout)
+            method = "file_chooser"
+
+        verified = True
+        if verify:
+            verified = await _verify_uploaded_filename(session.page, resolved, timeout=5000)
+
+    if verify and not verified:
+        names = [Path(f).name for f in resolved]
+        raise AssertionError(
+            f"upload_file: files were set via '{method}' but none of {names} "
+            f"appeared in any file input or on the page — upload may have been rejected."
+        )
+
+    return {"selector": sel, "files": resolved, "method": method, "verified": verified, "uploaded": True}
 
 
 @register_tool(

@@ -69,5 +69,5 @@ TOAST_SUCCESS_PHRASES = [
     "terdaftar & nib terbit", "dokumen ukl-upl diproses & terbit",
     "retribusi dibayar", "pbg terbit", "terkirim ke verifikator",
     "fiktif positif", "sertifikat standar terbit", "hasil uji lab diunggah",
-    "pb umku terbit", "dokumen amdal diproses & terbit", "permohonan izin terkirim",
+    "pb umku terbit", "dokumen amdal diproses & terbit", "permohonan izin terkirim", "Good Job!"
 ]

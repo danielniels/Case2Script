@@ -46,11 +46,11 @@ async def start_run(req: RunRequest, request: Request):
     session_id = req.session_id or str(uuid.uuid4())[:8]
     total_steps = len(req.steps)
     state: RunState = registry.new_run(
-        req.suite_id, req.test_case_id, total_steps, req.test_case_name or ""
+        req.suite_id, req.test_case_id, total_steps, req.test_case_name or "", session_id
     )
 
     task = asyncio.create_task(
-    run_test_case(state, req.steps, session_id, request, req.test_data)
+        run_test_case(state, req.steps, session_id, request, req.test_data)
     )
     state._task = task
 
@@ -105,7 +105,7 @@ async def start_replay(req: ReplayRequest, request: Request):
     total_steps = len(steps)
 
     state: RunState = registry.new_run(
-        req.suite_id, req.test_case_id, total_steps, req.test_case_name or ""
+        req.suite_id, req.test_case_id, total_steps, req.test_case_name or "", session_id
     )
     task = asyncio.create_task(
         replay_test_case(state, steps, session_id, request)
@@ -158,7 +158,12 @@ async def run_events(run_id: str, request: Request):
 @router.post("/{run_id}/stop")
 async def stop_run(run_id: str, request: Request):
     registry: RunRegistry = request.app.state.runs
+    state = registry.get(run_id)
     stopped = registry.stop(run_id)
     if not stopped:
         raise HTTPException(status_code=404, detail=f"Run {run_id!r} not found or not running")
+    # Close the Playwright browser session so the browser window closes immediately
+    if state and state.session_id:
+        sessions = request.app.state.sessions
+        await sessions.close(state.session_id)
     return {"run_id": run_id, "status": "stopped"}

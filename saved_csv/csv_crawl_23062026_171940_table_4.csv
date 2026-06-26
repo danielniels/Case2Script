@@ -1,0 +1,6 @@
+﻿Reason,Description,Related configuration
+Swal.DismissReason.backdrop,The user clicked the backdrop.,allowOutsideClick
+Swal.DismissReason.cancel,The user clicked the cancel button.,showCancelButton
+Swal.DismissReason.close,The user clicked the close button.,showCloseButton
+Swal.DismissReason.esc,The user clicked the Esc key.,allowEscapeKey
+Swal.DismissReason.timer,"The timer ran out, and the alert closed automatically.",timer

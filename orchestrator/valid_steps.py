@@ -101,6 +101,24 @@ def extract_toast_assertion(step_description: str):
     return None
 
 
+def extract_upload(step_description: str):
+    """Returns (label_hint, filename) if step is a file upload, else None.
+
+    Patterns (case-insensitive, separator → / -> / :):
+      "Upload Dokumen → invoice.pdf"
+      "Unggah KTP → ktp.png"
+      "Upload File: report.pdf"
+    filename resolves into data/fixtures/ at execution time (handled by upload_file tool).
+    """
+    s = step_description.strip()
+    m = re.match(r'^(?:Upload|Unggah)\s+(.*?)\s*(?:→|->|:)\s*(.+)$', s, re.IGNORECASE)
+    if m:
+        label_hint = m.group(1).strip()
+        filename = m.group(2).strip()
+        return (label_hint, filename)
+    return None
+
+
 def extract_page_assertion(step_description: str):
     """
     Returns (page_name, url_keyword) if step asserts "we are on page X", else None.

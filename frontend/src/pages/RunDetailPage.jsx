@@ -181,21 +181,34 @@ export default function RunDetailPage() {
         )}
       </div>
 
-      {/* Downloads */}
+      {/* Downloads + Edit */}
       {meta && (meta.script_path || meta.report_path) && (
-        <div className="flex gap-2">
+        <div className="flex flex-wrap gap-2">
           {meta.script_path && (
-            <a
-              id="run-detail-script-download"
-              href={scriptDownloadUrl(meta.script_path)}
-              download
-              className="flex items-center gap-1.5 px-3 py-1.5 bg-gray-800 hover:bg-gray-700 rounded-lg text-xs text-gray-300 transition-colors"
-            >
-              <svg className="w-3.5 h-3.5 text-yellow-400" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4" />
-              </svg>
-              Playwright Script
-            </a>
+            <>
+              <a
+                id="run-detail-script-download"
+                href={scriptDownloadUrl(meta.script_path)}
+                download
+                className="flex items-center gap-1.5 px-3 py-1.5 bg-gray-800 hover:bg-gray-700 rounded-lg text-xs text-gray-300 transition-colors"
+              >
+                <svg className="w-3.5 h-3.5 text-yellow-400" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4" />
+                </svg>
+                Download .py
+              </a>
+              <button
+                id="run-detail-script-edit"
+                onClick={() => navigate(`/scripts/${encodeURIComponent(meta.script_path)}`)}
+                className="flex items-center gap-1.5 px-3 py-1.5 bg-indigo-900/50 hover:bg-indigo-800/60 border border-indigo-700/50 rounded-lg text-xs text-indigo-300 transition-colors"
+              >
+                <svg className="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2}
+                    d="M11 5H6a2 2 0 00-2 2v11a2 2 0 002 2h11a2 2 0 002-2v-5m-1.414-9.414a2 2 0 112.828 2.828L11.828 15H9v-2.828l8.586-8.586z" />
+                </svg>
+                Edit Script
+              </button>
+            </>
           )}
           {meta.report_path && (
             <a

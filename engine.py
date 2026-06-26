@@ -299,6 +299,7 @@ async def execute_step(body: dict, request: Request) -> dict:
 
             report_path = None
             script_path = None
+            py_script_path = None
             _is_last_step = (
                 (test_case_id and step_index and total_steps and step_index >= total_steps)
                 or (test_case_id and method == "close_session")
@@ -308,9 +309,12 @@ async def execute_step(body: dict, request: Request) -> dict:
                 report_path = finalized.get("report_path")
                 script_path = await scripts.get_script_path(test_case_id)
                 await scripts.finalize_script(test_case_id)
+                py_script_path = await scripts.get_py_script_path(test_case_id)
                 failed_steps = await scripts.get_failed_steps(test_case_id)
                 log(sid, f"[REPORT SAVED] {report_path}")
                 log(sid, f"[SCRIPT SAVED] {script_path}")
+                if py_script_path:
+                    log(sid, f"[PY SCRIPT] {py_script_path}")
                 if not failed_steps:
                     log(sid, "  ✔  ALL STEPS PASSED")
                 await request.app.state.sessions.close(sid)
@@ -328,6 +332,7 @@ async def execute_step(body: dict, request: Request) -> dict:
                     "test_step_id": test_step_id,
                     "report_path": report_path,
                     "script_path": script_path,
+                    "py_script_path": py_script_path,
                 },
             }
 
@@ -364,6 +369,7 @@ async def execute_step(body: dict, request: Request) -> dict:
 
                 report_path = None
                 script_path = None
+                py_script_path = None
                 _is_last_step_fail = (
                     (test_case_id and step_index and total_steps and step_index >= total_steps)
                     or (test_case_id and method == "close_session")
@@ -373,12 +379,16 @@ async def execute_step(body: dict, request: Request) -> dict:
                     report_path = finalized.get("report_path")
                     script_path = await scripts.get_script_path(test_case_id)
                     await scripts.finalize_script(test_case_id)
+                    py_script_path = await scripts.get_py_script_path(test_case_id)
                     log(sid, f"[REPORT SAVED] {report_path}")
                     log(sid, f"[SCRIPT SAVED] {script_path}")
+                    if py_script_path:
+                        log(sid, f"[PY SCRIPT] {py_script_path}")
                     await request.app.state.sessions.close(sid)
             else:
                 report_path = None
                 script_path = None
+                py_script_path = None
 
             log(sid, f"FAILED: {type(e).__name__}: {error_message[:200]}")
             return {
@@ -396,6 +406,7 @@ async def execute_step(body: dict, request: Request) -> dict:
                     "test_step_id": test_step_id,
                     "report_path": report_path,
                     "script_path": script_path,
+                    "py_script_path": py_script_path,
                 },
             }
 

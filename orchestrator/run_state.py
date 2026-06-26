@@ -11,11 +11,12 @@ from typing import Any, Dict, List, Optional
 
 class RunState:
     def __init__(self, run_id: str, suite_id: str, test_case_id: str,
-                 total_steps: int, test_case_name: str = ""):
+                 total_steps: int, test_case_name: str = "", session_id: str = ""):
         self.run_id = run_id
         self.suite_id = suite_id
         self.test_case_id = test_case_id
         self.test_case_name = test_case_name
+        self.session_id = session_id
         self.total_steps = total_steps
         self.status = "running"      # running | passed | failed | stopped
         self.current_step = 0
@@ -76,9 +77,9 @@ class RunRegistry:
         self._lock = asyncio.Lock()
 
     def new_run(self, suite_id: str, test_case_id: str, total_steps: int,
-                test_case_name: str = "") -> RunState:
+                test_case_name: str = "", session_id: str = "") -> RunState:
         run_id = str(uuid.uuid4())[:8]
-        state = RunState(run_id, suite_id, test_case_id, total_steps, test_case_name)
+        state = RunState(run_id, suite_id, test_case_id, total_steps, test_case_name, session_id)
         self._runs[run_id] = state
         return state
 

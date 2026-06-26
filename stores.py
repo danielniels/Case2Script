@@ -284,10 +284,11 @@ class ReportStore:
 #         'if (!await page.locator(' + _js(p["selector"]) + ').first().isDisabled()) '
 #         'throw new Error("assert_disabled failed, element enabled: " + ' + _js(p["selector"]) + ');'
 #     ),
-#     "assert_url": lambda p: (
-#         'if (!page.url().includes(' + _js(p["expected"]) + ')) '
-#         'throw new Error("assert_url failed — got: " + page.url());'
-#     ),
+    # "assert_url": lambda p: (
+    #     'try { await page.waitForURL("**/*' + p["expected"] + '*", { timeout: ' + str(p.get("timeout", 8000)) + ' }); } catch (e) {}\n'
+    #     '    if (!page.url().includes(' + _js(p["expected"]) + ')) '
+    #     'throw new Error("assert_url failed — got: " + page.url());'
+    # ),
 #     "assert_toast": lambda p: (
 #         '{ const _exp = ' + _js(p.get("expected_text", "")) + '; '
 #         'const _to = ' + str(int(p.get("timeout", 6000))) + '; '
@@ -584,6 +585,10 @@ _PY_TEMPLATES = {
         f"    raise AssertionError(f\"assert_disabled failed, element enabled: {p['selector']!r}\")"
     ),
     "assert_url": lambda p: (
+        f"try:\n"
+        f"    await page.wait_for_url('**/*{p['expected']}*', timeout={p.get('timeout', 8000)})\n"
+        f"except Exception:\n"
+        f"    pass\n"
         f"if {_py(p['expected'])} not in page.url:\n"
         f"    raise AssertionError(f\"assert_url failed — got: {{page.url}}\")"
     ),
@@ -754,6 +759,7 @@ class ScriptStore:
     def __init__(self):
         self._steps: Dict[str, list] = {}
         self._paths: Dict[str, str] = {}
+        self._py_paths: Dict[str, str] = {}
         self._lock = asyncio.Lock()
 
     async def init_script(self, test_case_id: str, run_timestamp: str, session_id: str):
@@ -824,6 +830,7 @@ class ScriptStore:
 
             py_path = generate_playwright_py_from_json(path)
             if py_path:
+                self._py_paths[test_case_id] = py_path
                 print(f"[ScriptStore] Playwright script (PY): {py_path}")
 
             print(f"[ScriptStore] Script finalized: {path}")
@@ -844,6 +851,10 @@ class ScriptStore:
     async def get_script_path(self, test_case_id: str) -> Optional[str]:
         async with self._lock:
             return self._paths.get(test_case_id)
+
+    async def get_py_script_path(self, test_case_id: str) -> Optional[str]:
+        async with self._lock:
+            return self._py_paths.get(test_case_id)
 
     async def clear(self, test_case_id: str):
         async with self._lock:

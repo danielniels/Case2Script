@@ -22,6 +22,7 @@ from orchestrator.valid_steps import (
     extract_credential_fill,
     extract_page_assertion,
     extract_toast_assertion,
+    extract_upload,
     extract_valid_assertion,
 )
 
@@ -118,6 +119,45 @@ async def run_test_case(
                     print(f"[Runner] Credential bypass: no '{field_type}' element found, falling back to LLM")
                     # Fall through — other deterministic checks won't match this
                     # step pattern, so execution proceeds directly to LLM path.
+
+            # ── Upload bypass — fetch elements, skip LLM ────────────────────
+            # Covers: "Upload <label> → <filename>" / "Unggah <label> → <filename>"
+            # Falls back to LLM if no upload target found on the page.
+            up = extract_upload(step_desc)
+            if up:
+                label_hint, filename = up
+                up_elements: list = []
+                try:
+                    up_session = await get_session(request, session_id)
+                    from tools import cmd_get_interactable_elements
+                    el_resp = await cmd_get_interactable_elements({}, up_session)
+                    up_elements = el_resp.get("elements", [])
+                except Exception as exc:
+                    print(f"[Runner] Upload bypass: elements fetch failed: {exc}")
+
+                up_selector = _find_upload_selector(up_elements, label_hint)
+                if up_selector:
+                    step_started_at = datetime.now(timezone.utc).isoformat()
+                    body = _prepare_payload(
+                        method="upload_file",
+                        params={"selector": up_selector, "files": filename, "verify_filename": True},
+                        session_id=session_id, state=state, step_index=i, step_id=step_id,
+                        step_desc=step_desc, step_started_at=step_started_at, final_attempt=True,
+                    )
+                    result = await execute_step(body, request)
+                    _emit_step_end(state, result, i, step_desc)
+                    await post_step_history(
+                        job_name=state.test_case_name, run_id=state.test_case_id,
+                        process_name=step_desc, ok=result.get("ok", False), detail="",
+                        start=step_started_at, step_index=i, total_steps=state.total_steps,
+                        test_step_id=step_id,
+                    )
+                    if _is_critical_failure(result.get("ok", False), step_desc):
+                        _emit_critical_stop(state, i, step_desc)
+                        break
+                    continue
+                else:
+                    print(f"[Runner] Upload bypass: no upload target for hint '{label_hint}', falling back to LLM")
 
             # ── Page-assertion bypass — no LLM, direct assert_url ───────────
             # Covers: "Halaman <Name>" / "Menampilkan Halaman <Name>" (no URL in step).
@@ -385,6 +425,54 @@ def _find_credential_selector(elements: list, field_type: str) -> Optional[str]:
     return None
 
 
+def _find_upload_selector(elements: list, label_hint: str) -> Optional[str]:
+    """Find the upload target from live page elements.
+
+    Priority tiers (stops at first hit):
+      pass 1   : real file input — wins regardless of hint
+      pass 2a-i: upload-word AND hint both match (most specific — disambiguates multi-upload pages)
+      pass 2a-ii: upload-word only (no hint, or hint absent from blob)
+      pass 2b  : hint only, no upload-word — lowest confidence
+    Returns None → caller falls back to LLM.
+    """
+    hint = (label_hint or "").lower()
+    _UPLOAD_WORDS = {"upload", "unggah", "browse", "choose file", "pilih file", "select file", "attach", "lampiran"}
+
+    # pass 1: real file input wins unconditionally
+    for el in elements:
+        if (el.get("tag") or "").upper() == "INPUT" and (el.get("type") or "").lower() == "file":
+            if el.get("suggested_selector"):
+                return el["suggested_selector"]
+            if el.get("id"):
+                return f'//INPUT[@id="{el["id"]}"]'
+            return '//INPUT[@type="file"]'
+
+    # pass 2a-i: upload-word AND hint both present — most specific match
+    if hint:
+        for el in elements:
+            blob = " ".join(str(el.get(k, "")) for k in ("text", "aria_label", "placeholder", "class", "id")).lower()
+            if any(w in blob for w in _UPLOAD_WORDS) and hint in blob:
+                if el.get("suggested_selector"):
+                    return el["suggested_selector"]
+
+    # pass 2a-ii: upload-word only — picks first upload target when hint absent or unmatched
+    for el in elements:
+        blob = " ".join(str(el.get(k, "")) for k in ("text", "aria_label", "placeholder", "class", "id")).lower()
+        if any(w in blob for w in _UPLOAD_WORDS):
+            if el.get("suggested_selector"):
+                return el["suggested_selector"]
+
+    # pass 2b: hint only, no upload-word — lowest confidence
+    if hint:
+        for el in elements:
+            blob = " ".join(str(el.get(k, "")) for k in ("text", "aria_label", "placeholder", "class", "id")).lower()
+            if hint in blob:
+                if el.get("suggested_selector"):
+                    return el["suggested_selector"]
+
+    return None
+
+
 def _is_critical_failure(ok: bool, step_desc: str) -> bool:
     """True if step failed AND its description contains a critical keyword."""
     return not ok and any(kw in step_desc.lower() for kw in _CRITICAL_STEP_KEYWORDS)
@@ -443,6 +531,12 @@ def _emit_step_end(
     step_desc: str,
 ) -> None:
     ok = result.get("ok", False)
+    # Capture finalized paths from last-step meta (non-null only on the last step)
+    meta = result.get("meta") or {}
+    if meta.get("py_script_path"):
+        state.script_path = meta["py_script_path"]
+    if meta.get("report_path"):
+        state.report_path = meta["report_path"]
     state.push_event({
         "type":             "step_end",
         "step_index":       step_index,

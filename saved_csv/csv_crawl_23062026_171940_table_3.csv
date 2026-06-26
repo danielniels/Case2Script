@@ -1,0 +1,6 @@
+﻿Key,Description
+isConfirmed,"The ""Confirm"" button was clicked, the value will contain the result"
+isDenied,"The ""Deny"" button was clicked, the value will be false. Alternatively, if there's an input in a popup, you can use returnInputValueOnDeny: true to return the input's value."
+isDismissed,"The ""Cancel"" button was clicked, the dismiss will beSwal.DismissReason.cancel"
+value,"The value from the popup, possible values:true for simple confirmed dialogsfalse for denied popupsany value for popups with inputs"
+dismiss,"The dismissal reason, see the Handling Dismissals section for details"

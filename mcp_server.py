@@ -23,14 +23,15 @@ load_dotenv()
 import asyncio
 import json
 import os
+import sys
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Optional
 
 import httpx
 import uvicorn
-from fastapi import FastAPI, Request
-from fastapi.responses import JSONResponse
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 from playwright.async_api import async_playwright
@@ -208,45 +209,177 @@ async def root():
 
 # ==================== Script Read/Write API ====================
 
-from fastapi.responses import FileResponse
-from pydantic import BaseModel as _BM
-
-class _ScriptWrite(_BM):
+class _ScriptWrite(BaseModel):
     path: str
     content: str
 
 
+class _ScriptRun(BaseModel):
+    path: str
+
+
+_SCRIPT_RUN_TIMEOUT = int(os.getenv("SCRIPT_RUN_TIMEOUT_SECONDS", "300"))
+_SCREENSHOT_STATIC_ROOT = Path("data/saved_playwright_scripts_py/screenshots").resolve()
+_DATA_ROOT = Path("data").resolve()
+
+
 _ALLOWED_SCRIPT_SUFFIXES = {".js", ".py"}
+
+# Directories from which scripts may be served or overwritten.
+# Resolved at import time so Path.relative_to() comparisons are reliable.
+_SCRIPT_ALLOWED_DIRS = [
+    Path("data/saved_playwright_scripts_py").resolve(),
+    Path("data/saved_scripts").resolve(),
+    Path("saved_playwright_scripts").resolve(),  # legacy MCP-folder output
+    Path("saved_scripts").resolve(),             # legacy MCP-folder output
+]
+
+
+def _resolve_safe_script_path(raw: str) -> Optional[Path]:
+    """Resolve a client-supplied path and verify it stays within allowed dirs."""
+    try:
+        p = Path(raw).resolve()
+    except Exception:
+        return None
+    if p.suffix not in _ALLOWED_SCRIPT_SUFFIXES:
+        return None
+    for allowed in _SCRIPT_ALLOWED_DIRS:
+        try:
+            p.relative_to(allowed)
+            return p
+        except ValueError:
+            continue
+    return None
+
+
+def _find_latest_py_script(test_case_id: str) -> Optional[Path]:
+    """Return the most-recently-modified .py script for test_case_id, or None."""
+    script_dir = Path("data/saved_playwright_scripts_py")
+    if not script_dir.exists():
+        return None
+    clean = test_case_id.replace(" ", "_").replace("=", "")
+    matches = sorted(
+        script_dir.glob(f"{clean}_*.py"),
+        key=lambda p: p.stat().st_mtime,
+        reverse=True,
+    )
+    return matches[0] if matches else None
+
+
+@app.get("/api/scripts/latest-py")
+async def get_latest_py_script(test_case_id: str):
+    """Return path + content of the newest generated .py script for a test case."""
+    p = _find_latest_py_script(test_case_id)
+    if not p:
+        raise HTTPException(
+            status_code=404,
+            detail=f"No .py script found for test_case_id='{test_case_id}'. Run the test first.",
+        )
+    return {"path": str(p).replace("\\", "/"), "content": p.read_text(encoding="utf-8")}
 
 
 @app.get("/api/scripts")
 async def read_script(path: str):
-    p = Path(path)
-    if not p.exists() or p.suffix not in _ALLOWED_SCRIPT_SUFFIXES:
-        from fastapi import HTTPException
+    p = _resolve_safe_script_path(path)
+    if p is None or not p.exists():
         raise HTTPException(status_code=404, detail="Script not found")
-    return {"path": path, "content": p.read_text(encoding="utf-8")}
+    return {"path": str(p).replace("\\", "/"), "content": p.read_text(encoding="utf-8")}
 
 
 @app.post("/api/scripts")
 async def write_script(body: _ScriptWrite):
-    p = Path(body.path)
-    if p.suffix not in _ALLOWED_SCRIPT_SUFFIXES:
-        from fastapi import HTTPException
-        raise HTTPException(status_code=400, detail="Only .js or .py scripts can be saved")
+    p = _resolve_safe_script_path(body.path)
+    if p is None:
+        raise HTTPException(status_code=403, detail="Path not allowed")
+    # Keep a backup of the previous version before overwriting
+    if p.exists():
+        p.rename(p.with_suffix(p.suffix + ".bak"))
     p.parent.mkdir(parents=True, exist_ok=True)
     p.write_text(body.content, encoding="utf-8")
-    return {"saved": True, "path": body.path}
+    return {"saved": True, "path": str(p).replace("\\", "/")}
 
 
 @app.get("/api/scripts/download")
 async def download_script(path: str):
-    p = Path(path)
-    if not p.exists() or p.suffix not in _ALLOWED_SCRIPT_SUFFIXES:
-        from fastapi import HTTPException
+    p = _resolve_safe_script_path(path)
+    if p is None or not p.exists():
         raise HTTPException(status_code=404, detail="Script not found")
     media_type = "application/javascript" if p.suffix == ".js" else "text/x-python"
     return FileResponse(str(p), filename=p.name, media_type=media_type)
+
+
+@app.post("/api/scripts/run")
+async def run_script(body: _ScriptRun):
+    p = _resolve_safe_script_path(body.path)
+    if p is None:
+        raise HTTPException(status_code=403, detail="Path not allowed")
+    if not p.exists():
+        raise HTTPException(status_code=404, detail="Script not found")
+    if p.suffix != ".py":
+        raise HTTPException(status_code=400, detail="Only .py scripts can be executed")
+
+    screenshot_dir = f"data/saved_playwright_scripts_py/screenshots/{p.stem}"
+
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            sys.executable, str(p),
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Failed to start subprocess: {exc}")
+
+    try:
+        stdout_b, stderr_b = await asyncio.wait_for(
+            proc.communicate(), timeout=_SCRIPT_RUN_TIMEOUT
+        )
+    except asyncio.TimeoutError:
+        try:
+            proc.kill()
+        except Exception:
+            pass
+        await proc.wait()
+        return {
+            "ok": False,
+            "exit_code": -1,
+            "stdout": "",
+            "stderr": f"[Case2Script] Script exceeded timeout ({_SCRIPT_RUN_TIMEOUT}s) and was killed.",
+            "screenshot_dir": screenshot_dir,
+            "timed_out": True,
+        }
+
+    return {
+        "ok": proc.returncode == 0,
+        "exit_code": proc.returncode,
+        "stdout": stdout_b.decode("utf-8", errors="replace"),
+        "stderr": stderr_b.decode("utf-8", errors="replace"),
+        "screenshot_dir": screenshot_dir,
+        "timed_out": False,
+    }
+
+
+@app.get("/api/scripts/screenshots")
+async def list_script_screenshots(screenshot_dir: str):
+    try:
+        d = Path(screenshot_dir).resolve()
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid directory path")
+    try:
+        d.relative_to(_SCREENSHOT_STATIC_ROOT)
+    except ValueError:
+        raise HTTPException(status_code=403, detail="Directory not in allowed path")
+    if not d.exists() or not d.is_dir():
+        return {"screenshots": []}
+    pngs = sorted(d.glob("*.png"), key=lambda f: f.name)
+    return {
+        "screenshots": [
+            {
+                "name": f.name,
+                "url": "/data/" + str(f.relative_to(_DATA_ROOT)).replace("\\", "/"),
+            }
+            for f in pngs
+        ]
+    }
 
 
 # ==================== Serve Static Data Files (screenshots, reports) ====================

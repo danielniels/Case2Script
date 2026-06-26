@@ -2,6 +2,7 @@ import { createContext, useContext, useState } from 'react'
 import { BrowserRouter, Routes, Route, NavLink } from 'react-router-dom'
 import RunPage from './pages/RunPage'
 import RunDetailPage from './pages/RunDetailPage'
+import ScriptEditor from './pages/ScriptEditor'
 
 // Shared context so RunPage can tell Sidebar which run just started —
 // no localStorage, so there's never a stale run_id from a dead server session.
@@ -22,8 +23,8 @@ function Sidebar() {
       <div className="px-4 py-5">
         <div className="flex items-center gap-2.5">
           <div className="w-8 h-8 rounded-lg bg-indigo-600 flex items-center justify-center flex-shrink-0">
-            <svg className="w-4 h-4 text-white" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M13 10V3L4 14h7v7l9-11h-7z" />
+            <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="currentColor" class="size-6">
+              <path fill-rule="evenodd" d="M2.25 6a3 3 0 0 1 3-3h13.5a3 3 0 0 1 3 3v12a3 3 0 0 1-3 3H5.25a3 3 0 0 1-3-3V6Zm3.97.97a.75.75 0 0 1 1.06 0l2.25 2.25a.75.75 0 0 1 0 1.06l-2.25 2.25a.75.75 0 0 1-1.06-1.06l1.72-1.72-1.72-1.72a.75.75 0 0 1 0-1.06Zm4.28 4.28a.75.75 0 0 0 0 1.5h3a.75.75 0 0 0 0-1.5h-3Z" clip-rule="evenodd" />
             </svg>
           </div>
           <div>
@@ -77,6 +78,7 @@ function Layout() {
           <Routes>
             <Route path="/" element={<RunPage />} />
             <Route path="/runs/:runId" element={<RunDetailPage />} />
+            <Route path="/scripts/:scriptPath" element={<ScriptEditor />} />
           </Routes>
         </main>
       </div>

@@ -1,0 +1,42 @@
+﻿Method,Description
+Swal.isVisible(),Determine if popup is shown.
+Swal.mixin({ ...options }),Returns an extended version of Swal containing params as defaults. Useful for reusing Swal configuration.
+Swal.update({...options}),Updates popup options.
+Swal.close(),"Close the currently open SweetAlert2 popup programmatically, the Promise returned by Swal.fire() will be resolved with an empty object { }"
+Swal.getContainer(),Get the popup container which contains the backdrop and the popup itself.
+Swal.getPopup(),Get the popup.
+Swal.getTitle(),Get the popup title.
+Swal.getProgressSteps(),Get the progress steps.
+Swal.getCloseButton(),Get the close button.
+Swal.getIcon(),Get the icon.
+Swal.getIconContent(),Get the icon content (without border).
+Swal.getHtmlContainer(),Gets the DOM element where the html/text parameter is rendered to.
+Swal.getImage(),Get the image.
+Swal.getActions(),Get the actions block (buttons container).
+Swal.getFooter(),Get the popup footer.
+Swal.getFocusableElements(),Get all focusable elements in the popup.
+Swal.getConfirmButton(),"Get the ""Confirm"" button."
+Swal.getDenyButton(),"Get the ""Deny"" button."
+Swal.getCancelButton(),"Get the ""Cancel"" button."
+Swal.enableButtons(),"Enable ""Confirm"" and ""Cancel"" buttons."
+Swal.disableButtons(),"Disable ""Confirm"" and ""Cancel"" buttons."
+Swal.showLoading(),"Shows loader (spinner), this is useful with AJAX requests. By default the loader be shown instead of the ""Confirm"" button, but if you want another button to be replaced with a loader, just pass it like this: Swal.showLoading(Swal.getDenyButton())"
+Swal.hideLoading(),Hides loader and shows back the button which was hidden by .showLoading()
+Swal.isLoading(),Determine if popup is in the loading state. Related methods: Swal.showLoading() and Swal.hideLoading()
+Swal.getTimerLeft(),Returns the time left in case when timer parameter is set.
+Swal.stopTimer(),Stops the timer in case when timer parameter is set. Returns the time left
+Swal.resumeTimer(),Resume the timer previously stopped. Returns the time left
+Swal.toggleTimer(),Toggle state of the timer between stopped and running. Returns the time left
+Swal.isTimerRunning(),"Returns the status of a timer: true if is running, false if it's paused"
+Swal.increaseTimer(ms),Increase the timer by ms milliseconds. Returns the time left
+Swal.clickConfirm(),"Click the ""Confirm""-button programmatically."
+Swal.clickDeny(),"Click the ""Deny""-button programmatically."
+Swal.clickCancel(),"Click the ""Cancel""-button programmatically."
+Swal.getInput(),"Get the input DOM node, this method works with input parameter."
+Swal.disableInput(),Disable input. A disabled input element is unusable and un-clickable.
+Swal.enableInput(),Enable input.
+Swal.showValidationMessage(message),Show the validation message DOM node.
+Swal.resetValidationMessage(),Hide the validation message DOM node.
+Swal.getValidationMessage(),Get the validation message DOM node.
+Swal.isValidParameter(param),Determine if parameter name is valid.
+Swal.isUpdatableParameter(param),Determine if parameter name is valid for Swal.update() method.

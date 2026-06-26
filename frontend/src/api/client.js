@@ -56,6 +56,27 @@ export const converters = {
   excelTemplate: () => '/convert/excel/template',
 }
 
+// ── Scripts ──────────────────────────────────────────────────────────────────
+
+export const scripts = {
+  /** Fetch content of a .py or .js script by file path */
+  get: (path) => _fetch(`/api/scripts?path=${encodeURIComponent(path)}`),
+  /** Overwrite a script file (backend keeps a .bak of the previous version) */
+  save: (path, content) =>
+    _fetch('/api/scripts', { method: 'POST', body: JSON.stringify({ path, content }) }),
+  /** Download URL for the file (use as <a href> with download attribute) */
+  downloadUrl: (path) => `/api/scripts/download?path=${encodeURIComponent(path)}`,
+  /** Find the newest generated .py for a test_case_id */
+  latestPy: (testCaseId) =>
+    _fetch(`/api/scripts/latest-py?test_case_id=${encodeURIComponent(testCaseId)}`),
+  /** Execute a .py script as a subprocess; resolves when done (up to timeout) */
+  run: (path) =>
+    _fetch('/api/scripts/run', { method: 'POST', body: JSON.stringify({ path }) }),
+  /** List screenshot .png files in a screenshot_dir returned by run() */
+  screenshots: (dir) =>
+    _fetch(`/api/scripts/screenshots?screenshot_dir=${encodeURIComponent(dir)}`),
+}
+
 // ── Health ───────────────────────────────────────────────────────────────────
 
 export const health = () => _fetch('/health')
