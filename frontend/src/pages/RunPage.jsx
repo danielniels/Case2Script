@@ -1,5 +1,5 @@
 import { useContext, useEffect, useRef, useState } from 'react'
-import { useNavigate } from 'react-router-dom'
+import { useNavigate, useLocation } from 'react-router-dom'
 import { runs, converters, screenshotUrl, scriptDownloadUrl, reportViewUrl } from '../api/client'
 import { RunContext } from '../App'
 
@@ -58,8 +58,8 @@ const JSON_PLACEHOLDER = `{
   "test_data": { "username": "admin@mail.com", "password": "secret" },
   "steps": [
     { "test_step_id": "1", "test_step_description": "Navigate to https://app.example.com/login" },
-    { "test_step_id": "2", "test_step_description": "Fill username field with admin@mail.com" },
-    { "test_step_id": "3", "test_step_description": "Fill password field with secret" },
+    { "test_step_id": "2", "test_step_description": "Fill username field with {{username}}" },
+    { "test_step_id": "3", "test_step_description": "Fill password field with {{password}}" },
     { "test_step_id": "4", "test_step_description": "Click Login button" },
     { "test_step_id": "5", "test_step_description": "Verify dashboard page is visible" }
   ]
@@ -80,7 +80,8 @@ const TABS = [
 
 export default function RunPage() {
   const navigate = useNavigate()
-  const { setLastRunId } = useContext(RunContext)
+  const location = useLocation()
+  const { runId, setRunId, runStatus, setRunStatus, allSteps, setAllSteps, latestScreenshot, setLatestScreenshot } = useContext(RunContext)
 
   // ── Input mode ─────────────────────────────────────────────────────────────
   const [inputMode, setInputMode]     = useState('json')
@@ -101,13 +102,9 @@ export default function RunPage() {
   const [suite, setSuite]             = useState(null)
   const [selectedTcIdx, setSelectedTcIdx] = useState(0)
 
-  // ── Run state ──────────────────────────────────────────────────────────────
+  // ── Run state (local only — timer display) ─────────────────────────────────
   const [isStarting, setIsStarting]   = useState(false)
   const [parseError, setParseError]   = useState(null)
-  const [runId, setRunId]             = useState(null)
-  const [runStatus, setRunStatus]     = useState(null)
-  const [allSteps, setAllSteps]       = useState([])
-  const [latestScreenshot, setLatestScreenshot] = useState(null)
   const [startTime, setStartTime]     = useState(null)
   const [elapsed, setElapsed]         = useState(0)
   const [finalDuration, setFinalDuration] = useState(null)
@@ -117,10 +114,29 @@ export default function RunPage() {
   const timerRef    = useRef(null)
   const stepMapRef  = useRef({})
   const allStepsRef = useRef([])
+  // runStatusRef lets SSE/polling effects read the current runStatus without
+  // adding it to their dep arrays (we only want those effects to fire on runId changes).
+  const runStatusRef = useRef(runStatus)
 
   const isRunning = runStatus?.status === 'running'
 
   useEffect(() => { allStepsRef.current = allSteps }, [allSteps])
+  useEffect(() => { runStatusRef.current = runStatus }, [runStatus])
+
+  // Pre-fill from re-run (History page → Run Test)
+  useEffect(() => {
+    const s = location.state
+    if (!s) return
+    if (s.rerunMode === 'prompt' && s.rerunContent) {
+      setInputMode('prompt')
+      setPromptText(s.rerunContent)
+      setSuite(null)
+    } else if (s.rerunJson) {
+      setInputMode('json')
+      setJsonInput(s.rerunJson)
+    }
+    window.history.replaceState({}, '')
+  }, [])
 
   // Elapsed timer
   useEffect(() => {
@@ -138,6 +154,8 @@ export default function RunPage() {
   // SSE subscription
   useEffect(() => {
     if (!runId) return
+    // Skip re-subscribing when restoring a completed run from context on mount
+    if (runStatusRef.current?.status && runStatusRef.current.status !== 'running') return
     stepMapRef.current = {}
 
     const es = runs.events(runId)
@@ -182,6 +200,8 @@ export default function RunPage() {
   // Polling for script_path / report_path
   useEffect(() => {
     if (!runId) return
+    // Skip re-polling when restoring a completed run from context on mount
+    if (runStatusRef.current?.status && runStatusRef.current.status !== 'running') return
     const poll = async () => {
       try {
         const data = await runs.get(runId)
@@ -246,6 +266,8 @@ export default function RunPage() {
         test_data: parsed.test_data || {},
         steps: parsed.steps,
         session_id: parsed.session_id || undefined,
+        input_mode: 'json',
+        input_content: jsonInput.trim(),
       }
     } else {
       if (!suite) { setParseError('Convert the input first'); return }
@@ -257,6 +279,8 @@ export default function RunPage() {
         test_case_name: tc.test_case_name || '',
         test_data: tc.test_data || {},
         steps: tc.steps,
+        input_mode: inputMode,
+        input_content: inputMode === 'prompt' ? promptText.trim() : '',
       }
     }
 
@@ -278,7 +302,6 @@ export default function RunPage() {
       const result = await runs.start(payload)
       setRunId(result.run_id)
       setRunStatus({ status: 'running', ...result })
-      setLastRunId(result.run_id)
     } catch (e) {
       setParseError('Failed to start run: ' + e.message)
       setAllSteps([])

@@ -14,9 +14,10 @@ from typing import List, Optional
 
 from fastapi import Request
 
+from db import db_update_run, db_upsert_step
 from engine import execute_step, get_session
 from orchestrator.history import post_step_history
-from orchestrator.llm import resolve_step
+from orchestrator.llm import OllamaQuotaExceeded, resolve_step
 from orchestrator.run_state import RunState
 from orchestrator.valid_steps import (
     extract_credential_fill,
@@ -28,10 +29,23 @@ from orchestrator.valid_steps import (
 
 _MAX_ATTEMPTS = 3   # n8n: _can_retry = attempt < 3
 
-# Step descriptions containing these keywords are treated as critical for the
-# LLM path, toast bypass, and VALID: bypass. Page-assertion failures are
-# always critical regardless of keywords (see page-assertion bypass below).
 _CRITICAL_STEP_KEYWORDS = ["login", "log in", "masuk", "submit"]
+
+
+async def _emit_and_persist(db, state: RunState, result: dict, step_index: int, step_desc: str) -> None:
+    """Emit step_end SSE event and persist step to DB."""
+    _emit_step_end(state, result, step_index, step_desc)
+    if db:
+        ok = result.get("ok", False)
+        await db_upsert_step(
+            db,
+            run_id=state.run_id,
+            step_index=step_index,
+            description=step_desc,
+            status="passed" if ok else "failed",
+            screenshot_path=result.get("screenshot_path"),
+            error=result.get("error"),
+        )
 
 
 async def run_test_case(
@@ -50,6 +64,7 @@ async def run_test_case(
                Do NOT read test_data from individual step dicts.
     """
     test_data = test_data or {}
+    db = getattr(request.app.state, "db", None)
 
     try:
         for i, step in enumerate(steps, start=1):
@@ -60,6 +75,13 @@ async def run_test_case(
             step_desc = str(step.get("test_step_description") or f"Step {i}").strip()
             step_id   = step.get("test_step_id", str(i))
             # NOTE: test_data comes from the case level (parameter), NOT from step dict.
+
+            # ── Template variable substitution ───────────────────────────────
+            # Replace {{key}} placeholders with values from test_data.
+            # Happens before every path (bypass + LLM) so test_data works everywhere.
+            if test_data:
+                for _td_key, _td_val in test_data.items():
+                    step_desc = step_desc.replace(f"{{{{{_td_key}}}}}", str(_td_val))
 
             state.push_event({
                 "type":             "step_start",
@@ -99,7 +121,7 @@ async def run_test_case(
                         final_attempt=True,
                     )
                     result = await execute_step(body, request)
-                    _emit_step_end(state, result, i, step_desc)
+                    await _emit_and_persist(db, state, result, i, step_desc)
                     await post_step_history(
                         job_name=state.test_case_name,
                         run_id=state.test_case_id,
@@ -145,7 +167,7 @@ async def run_test_case(
                         step_desc=step_desc, step_started_at=step_started_at, final_attempt=True,
                     )
                     result = await execute_step(body, request)
-                    _emit_step_end(state, result, i, step_desc)
+                    await _emit_and_persist(db, state, result, i, step_desc)
                     await post_step_history(
                         job_name=state.test_case_name, run_id=state.test_case_id,
                         process_name=step_desc, ok=result.get("ok", False), detail="",
@@ -179,7 +201,7 @@ async def run_test_case(
                     final_attempt=True,
                 )
                 result = await execute_step(body, request)
-                _emit_step_end(state, result, i, step_desc)
+                await _emit_and_persist(db, state, result, i, step_desc)
                 await post_step_history(
                     job_name=state.test_case_name,
                     run_id=state.test_case_id,
@@ -214,7 +236,7 @@ async def run_test_case(
                     final_attempt=True,
                 )
                 result = await execute_step(body, request)
-                _emit_step_end(state, result, i, step_desc)
+                await _emit_and_persist(db, state, result, i, step_desc)
                 await post_step_history(
                     job_name=state.test_case_name,
                     run_id=state.test_case_id,
@@ -249,7 +271,7 @@ async def run_test_case(
                     final_attempt=True,
                 )
                 result = await execute_step(body, request)
-                _emit_step_end(state, result, i, step_desc)
+                await _emit_and_persist(db, state, result, i, step_desc)
                 await post_step_history(
                     job_name=state.test_case_name,
                     run_id=state.test_case_id,
@@ -273,32 +295,79 @@ async def run_test_case(
             step_result: dict = {"ok": False, "error": "not executed"}
             step_started_at = ""
 
+            # ── Element cache scoped to this step's retry loop ──────────────────
+            # Only refetch the interactable-elements DOM crawl when the page URL
+            # actually changed since the last fetch. Avoids re-crawling the full
+            # DOM (all frames) on every retry attempt when the previous attempt
+            # failed without navigating anywhere.
+            _cached_elements: list = []
+            _cached_url: Optional[str] = None
+
             for attempt in range(1, _MAX_ATTEMPTS + 1):
-                # ── Get Browser Interactables ──────────────────────────────────
-                elements: list = []
+                # ── Get Browser Interactables (cached by URL) ────────────────────
                 try:
                     session = await get_session(request, session_id)
-                    from tools import cmd_get_interactable_elements
-                    el_resp = await cmd_get_interactable_elements({}, session)
-                    elements = el_resp.get("elements", [])
+                    current_url = session.page.url
                 except Exception as exc:
-                    print(f"[Runner] Elements fetch failed (attempt {attempt}): {exc}")
+                    print(f"[Runner] get_session failed (attempt {attempt}): {exc}")
+                    current_url = None
+
+                if (
+                    current_url is not None
+                    and current_url == _cached_url
+                    and _cached_elements
+                    and attempt < _MAX_ATTEMPTS          # never reuse on the last attempt
+                ):
+                    elements = _cached_elements
+                    print(f"[Runner] elements: reused cache (url unchanged, attempt {attempt})")
+                else:
+                    elements = []
+                    try:
+                        from tools import cmd_get_interactable_elements
+                        el_resp = await cmd_get_interactable_elements({}, session)
+                        elements = el_resp.get("elements", [])
+                        _cached_elements = elements
+                        _cached_url = current_url
+                        print(f"[Runner] elements: refetched (url={current_url!r}, attempt {attempt})")
+                    except Exception as exc:
+                        print(f"[Runner] Elements fetch failed (attempt {attempt}): {exc}")
+                        # Best-effort fallback: reuse stale cache instead of an empty
+                        # list, so the LLM still has SOME context on this attempt.
+                        elements = _cached_elements
 
                 # ── build prompt → Ollama call → Parse LLM JSON ───────────────
                 try:
                     parsed = await resolve_step(
                         step_desc, session_id, elements, test_data, attempt
                     )
+                except OllamaQuotaExceeded as exc:
+                    parsed = {
+                        "_llm_error": True,
+                        "method": "noop",
+                        "params": {},
+                        "_raw_response": str(exc)[:200],
+                        "_quota_exceeded": True,
+                    }
+                    print(f"[Runner] LLM parse error (attempt {attempt}): {exc}")
                 except RuntimeError as exc:
-                    parsed = {"_llm_error": True, "method": "noop", "params": {}}
+                    parsed = {
+                        "_llm_error": True,
+                        "method": "noop",
+                        "params": {},
+                        "_raw_response": str(exc)[:200],
+                    }
                     print(f"[Runner] LLM parse error (attempt {attempt}): {exc}")
 
                 # ── _llm_error → treat as failed, same retry path ─────────────
                 if parsed.get("_llm_error"):
+                    _raw = parsed.get('_raw_response', '')
                     step_result = {
                         "ok":    False,
-                        "error": f"LLM error: {parsed.get('_raw_response', '')[:100]}",
+                        "error": f"LLM error: {_raw[:100]}",
                     }
+                    if parsed.get("_quota_exceeded"):
+                        print(f"[Runner] Quota exceeded — skipping remaining attempts for this step")
+                        break      # no point retrying — quota won't reset mid-run
                     if attempt < _MAX_ATTEMPTS:
                         continue   # Prep Retry → re-fetch elements, re-call LLM
                     break          # max retries exhausted
@@ -333,6 +402,9 @@ async def run_test_case(
                 step_result = await execute_step(body, request)
                 ok = step_result.get("ok", False)
 
+                if not ok:
+                    print(f"[Runner] Step {i} attempt {attempt}/{_MAX_ATTEMPTS} failed: {step_result.get('error', '')[:150]}")
+
                 if ok:
                     break   # IF Step Success TRUE → done, move to next step
 
@@ -342,7 +414,7 @@ async def run_test_case(
                 break           # max retries exhausted → fall through to history
 
             # ── Post to History API (once, after all attempts) ────────────────
-            _emit_step_end(state, step_result, i, step_desc)
+            await _emit_and_persist(db, state, step_result, i, step_desc)
             await post_step_history(
                 job_name=state.test_case_name,
                 run_id=state.test_case_id,
@@ -378,6 +450,17 @@ async def run_test_case(
             "status":      state.status,
             "finished_at": state.finished_at,
         })
+        if db:
+            await db_update_run(
+                db,
+                state.run_id,
+                status=state.status,
+                current_step=state.current_step,
+                finished_at=state.finished_at,
+                script_path=state.script_path,
+                report_path=state.report_path,
+                error=state.error,
+            )
 
 
 # ---------------------------------------------------------------------------

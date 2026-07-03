@@ -26,6 +26,11 @@ _HTTP_RETRY_COUNT = 3
 _HTTP_RETRY_WAIT  = 5.0   # seconds
 
 
+class OllamaQuotaExceeded(RuntimeError):
+    """Raised specifically when Ollama Cloud returns 429."""
+    pass
+
+
 # ---------------------------------------------------------------------------
 # call_ollama — port of n8n "Ollama call" HTTP Request node
 #
@@ -49,8 +54,6 @@ async def call_ollama(prompt: str) -> str:
                 resp = await client.post(f"{_OLLAMA_URL}/api/chat", json=payload)
                 resp.raise_for_status()
                 data = resp.json()
-            # Multi-source raw extraction — verbatim from n8n "Parse LLM JSON":
-            #   $json.response ?? $json.message?.content ?? $json.content?.[0]?.text ?? $json.data ?? ""
             raw = (
                 data.get("response")
                 or (data.get("message") or {}).get("content")
@@ -59,6 +62,24 @@ async def call_ollama(prompt: str) -> str:
                 or ""
             )
             return raw
+        except httpx.HTTPStatusError as exc:
+            # 429 = Ollama Cloud quota/rate limit exceeded. The retry window
+            # is 5s; the quota window is 5 HOURS — retrying can't fix this,
+            # it just burns 15s (3 x 5s) before failing anyway. Fail fast
+            # instead, with a message that tells the caller what actually
+            # happened (so it doesn't get logged as a generic "LLM error").
+            if exc.response.status_code == 429:
+                raise OllamaQuotaExceeded(
+                    f"Ollama quota/rate limit exceeded (429) — not retrying. "
+                    f"Session quota resets every 5h. Detail: {exc}"
+                ) from exc
+            last_exc = exc
+            if attempt < _HTTP_RETRY_COUNT:
+                print(
+                    f"[Ollama] HTTP {exc.response.status_code} error (attempt {attempt}/{_HTTP_RETRY_COUNT}): {exc}"
+                    f" — retrying in {_HTTP_RETRY_WAIT}s"
+                )
+                await asyncio.sleep(_HTTP_RETRY_WAIT)
         except Exception as exc:
             last_exc = exc
             if attempt < _HTTP_RETRY_COUNT:

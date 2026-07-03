@@ -567,7 +567,11 @@ _PY_TEMPLATES = {
     ),
 
     "assert_text": lambda p: (
-        f"t = (await page.locator({_py(p['selector'])}).first.inner_text()).strip()\n"
+        f"_loc = page.locator({_py(p['selector'])}).first\n"
+        f"try:\n"
+        f"    t = (await _loc.input_value()).strip()\n"
+        f"except Exception:\n"
+        f"    t = (await _loc.text_content() or '').strip()\n"
         f"if {_py(p['expected'])} not in t:\n"
         f"    raise AssertionError(f\"assert_text failed — expected {p['expected']!r}, got: {{t}}\")"
     ),
@@ -646,6 +650,14 @@ def generate_playwright_py_from_json(json_path: str) -> Optional[str]:
     if not steps:
         print(f"[Playwright Generator] No steps in {json_path}")
         return None
+
+    # Deduplicate by step id — when a run fails and retries, the JSON contains
+    # steps from both runs with the same ids. Keep only the last occurrence
+    # (the retry run), which has the most up-to-date selectors and status.
+    seen: dict = {}
+    for s in steps:
+        seen[s.get("id", id(s))] = s
+    steps = list(seen.values())
 
     stem = Path(json_path).stem
     pw_dir = Path("data/saved_playwright_scripts_py")
@@ -776,7 +788,8 @@ class ScriptStore:
             print(f"[ScriptStore] Script file created: {path}")
 
     async def append_step(self, test_case_id: str, method: str, params: dict,
-                           step_description: str, step_id: int, status: str = "passed"):
+                           step_description: str, step_id: int, status: str = "passed",
+                           note: str = ""):
         async with self._lock:
             if test_case_id not in self._steps:
                 return
@@ -787,7 +800,8 @@ class ScriptStore:
                 "step": step_description,
                 "status": status,
                 "params": params,
-                "id": step_id
+                "id": step_id,
+                "note": note,
             }
             self._steps[test_case_id].append(entry)
             self._flush(test_case_id)

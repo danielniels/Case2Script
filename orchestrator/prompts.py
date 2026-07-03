@@ -6,6 +6,7 @@ Ported verbatim from n8n nodes:
 """
 
 import json
+import re
 from typing import Optional
 
 # ---------------------------------------------------------------------------
@@ -35,10 +36,10 @@ clear_input       | params: sessionId, selector (XPath)
 press_key         | params: sessionId, key ("Escape" | "Enter" | "Tab" | "ArrowDown" | "ArrowUp" | "Backspace")
 upload_file       | params: sessionId, selector (XPath targeting <input type="file">), files (absolute path string)
 switch_tab        | params: sessionId, index (int, 0-based) OR url_contains (string)
-click_by_index    | params: sessionId, index (int, from elements list)
+click_by_index    | params: sessionId, index (int, from elements list), expected_text (string, exact text shown at [index] in AVAILABLE ELEMENTS — required for drift detection)
 
 screenshot           | params: sessionId only
-assert_text          | params: sessionId, selector (XPath), expected (text substring)
+assert_text          | params: sessionId, selector (XPath), expected (text substring) — for div/span/p/td/li; also works on input/textarea (reads value if no inner text)
 assert_visible       | params: sessionId, selector (XPath)
 assert_not_visible   | params: sessionId, selector (XPath)
 assert_disabled      | params: sessionId, selector (XPath)
@@ -67,6 +68,7 @@ Step mentions: "berhasil", "sukses", "tersimpan", "terhapus", "notifikasi muncul
   → use assert_toast (NOT screenshot) when a toast/snackbar/popup is expected after submit
 
 Step mentions: "tampil", "muncul di halaman", "valid:", "verify", "halaman X"
+  → assert_url if verifying that navigation to a specific page occurred (e.g. "Verify dashboard page is visible", "Halaman dashboard tampil")
   → assert_visible if a specific static page element must exist
   → assert_text if specific data must be verified on the page (e.g. "VALID: Data Ditemukan → Annual Leave")
   → screenshot only for general visual confirmation with no specific assertion needed
@@ -98,7 +100,16 @@ Step mentions logout, then "berhasil logout"
   → click for logout button, then assert_url or screenshot for verification
 
 Can't determine XPath from elements:
-  → click_by_index using index from AVAILABLE ELEMENTS list
+  → FIRST check: does the step description share any meaningful word (in
+    either Indonesian or English) with the target element's text,
+    aria-label, placeholder, or id, as shown in AVAILABLE ELEMENTS?
+  → If YES → click_by_index using that element's index.
+    ALWAYS include expected_text: copy the element's text exactly as shown
+    at [index].
+  → If NO element has any semantic relation to the step description →
+    do NOT guess an index. Return exactly: {"method": "no_match", "params": {}}
+    A step correctly reported as unresolved is better than a wrong click
+    reported as success.
 
 ================================
 XPATH RULES (MANDATORY)
@@ -109,7 +120,8 @@ Priority → use highest available from AVAILABLE ELEMENTS:
 2. //TAG[@aria-label="value"]                            → hyphen, never underscore
 3. //TAG[@name="value"]
 4. //TAG[@placeholder="value"]
-5. //TAG[.//text()[normalize-space(.) = "value"]]        → last resort
+5. //label[normalize-space(.)='Label Text']/following::input[1]  → for form inputs identified only by their visible label (e.g. OrangeHRM Vue inputs with no id/name)
+6. //TAG[.//text()[normalize-space(.) = "value"]]        → last resort
 
 Rules:
 - If @id exists → ALWAYS use @id, never switch to text or aria-label
@@ -118,6 +130,7 @@ Rules:
 - NEVER use @type alone (e.g. //INPUT[@type="email"])
 - NEVER guess or invent attribute values → use ONLY exact values from AVAILABLE ELEMENTS
 - NEVER include text param for click
+- For assert_text on a form input field → if no @id/@name/@aria-label on the input, use label-based XPath: //label[normalize-space(.)='<label text>']/following::input[1]
 - For fill steps with multiple similar fields (e.g. TKI Laki-Laki, TKI Perempuan, Tenaga Kerja Asing):
   → Match the field label EXACTLY to the element text in AVAILABLE ELEMENTS
   → Each field has a unique id → NEVER reuse the same selector for different fields
@@ -144,6 +157,44 @@ CONSTRAINTS
 
 
 # ---------------------------------------------------------------------------
+# Element relevance scoring — ranks elements vs the step description so the
+# LLM sees the most relevant element first regardless of DOM order.
+# ---------------------------------------------------------------------------
+_CLICK_WORDS = frozenset({
+    'klik', 'click', 'tap', 'press', 'tekan', 'pilih', 'submit',
+})
+_INPUT_WORDS = frozenset({
+    'isi', 'fill', 'ketik', 'type', 'masukkan', 'input', 'enter',
+})
+
+
+def _relevance_score(step_description: str, el: dict) -> int:
+    step_tokens = set(re.split(r'[^a-zA-Z0-9]+', step_description.lower()))
+    step_tokens.discard('')
+
+    score = 0
+    for field in ('text', 'aria_label', 'placeholder', 'id', 'name'):
+        val = el.get(field) or ''
+        el_tokens = set(re.split(r'[^a-zA-Z0-9]+', val.lower()))
+        el_tokens.discard('')
+        score += len(step_tokens & el_tokens)
+
+    step_words = set(step_description.lower().split())
+    tag = (el.get('tag') or '').upper()
+    el_type = (el.get('type') or '').lower()
+
+    if step_words & _CLICK_WORDS:
+        if tag in ('BUTTON', 'A') or (tag == 'INPUT' and el_type in ('submit', 'button', 'reset')):
+            score += 2
+
+    if step_words & _INPUT_WORDS:
+        if tag in ('INPUT', 'TEXTAREA') and el_type not in ('submit', 'button', 'reset', 'checkbox', 'radio'):
+            score += 2
+
+    return score
+
+
+# ---------------------------------------------------------------------------
 # Element formatter — verbatim from n8n "build prompt" jsCode
 # ---------------------------------------------------------------------------
 _MAX_EL = 50
@@ -161,6 +212,8 @@ def _format_element(i: int, el: dict) -> str:
         parts.append(f'aria-label="{el["aria_label"]}"')
     if el.get("placeholder"):
         parts.append(f'placeholder="{el["placeholder"]}"')
+    if el.get("label"):
+        parts.append(f'label="{el["label"]}"')
     if el.get("disabled"):
         parts.append("DISABLED")
     if el.get("text"):
@@ -185,14 +238,23 @@ def build_step_prompt(
     if test_data is None:
         test_data = {}
 
-    el_slice = elements[:_MAX_EL]
-    el_lines = [_format_element(i, el) for i, el in enumerate(el_slice)]
+    # Sort by relevance descending before applying _MAX_EL.
+    # orig_i (DOM-order index) is preserved as the printed [i] so that
+    # click_by_index, which re-queries the DOM at execution time in the same
+    # DOM order, resolves the same element the LLM was shown.
+    scored = sorted(
+        enumerate(elements),
+        key=lambda pair: _relevance_score(step_description, pair[1]),
+        reverse=True,
+    )
+    top = scored[:_MAX_EL]
+    el_lines = [_format_element(orig_i, el) for orig_i, el in top]
     el_str = "\n".join(el_lines)
 
     sections = [
         SYSTEM_PROMPT,
         f"SESSION ID: {session_id}",
-        f"AVAILABLE ELEMENTS ({len(elements)} total, showing {len(el_slice)}):\n{el_str}",
+        f"AVAILABLE ELEMENTS ({len(elements)} total, showing {len(top)}):\n{el_str}",
     ]
     if test_data:
         sections.append(f"TEST DATA:\n{json.dumps(test_data)}")

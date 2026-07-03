@@ -280,6 +280,31 @@ def smart_fix_llm_output(llm_output: dict, user_step_description: str = "") -> d
         method = "screenshot"
         params = {k: v for k, v in params.items() if k == "sessionId"}
 
+    # "verify <page> page is visible" / "halaman <X> tampil" → assert_url
+    # The LLM may still return screenshot for these; override to an actual assertion.
+    _page_verify_kws = ["verify", "verifikasi", "pastikan", "halaman ", "page "]
+    _page_name_kws = ["page", "halaman", "dashboard", "tampil", "visible"]
+    if (
+        method == "screenshot"
+        and any(k in desc_lower for k in _page_verify_kws)
+        and any(k in desc_lower for k in _page_name_kws)
+    ):
+        # Extract the most meaningful word after "verify … page" as the URL keyword
+        _url_kw = None
+        for _tok in re.split(r'[\s\-_/]+', user_step_description.lower()):
+            if _tok and _tok not in {"verify", "verifikasi", "pastikan", "halaman", "page",
+                                     "is", "that", "the", "a", "an", "tampil", "visible",
+                                     "muncul", "terlihat", "dashboard"}:
+                _url_kw = _tok
+                break
+        # Always try "dashboard" as a fallback keyword when present
+        if not _url_kw and "dashboard" in desc_lower:
+            _url_kw = "dashboard"
+        if _url_kw:
+            method = "assert_url"
+            params = {k: v for k, v in params.items() if k == "sessionId"}
+            params["expected"] = _url_kw
+
     if method == "fill" and "→" in user_step_description:
         parts = user_step_description.split("→", 1)
         extracted = parts[1].strip()
@@ -452,6 +477,16 @@ async def _force_action(page: Page, selector: str, action: str, text: str = ""):
             }
             target.dispatchEvent(new Event('input',  { bubbles: true }));
             target.dispatchEvent(new Event('change', { bubbles: true }));
+            return { ok: true, resolved: buildStableSelector(target) };
+        } else if (action === 'double_click') {
+            const init = (detail) => ({ bubbles: true, cancelable: true, view: window, detail });
+            target.dispatchEvent(new MouseEvent('mousedown', init(1)));
+            target.dispatchEvent(new MouseEvent('mouseup',   init(1)));
+            target.dispatchEvent(new MouseEvent('click',     init(1)));
+            target.dispatchEvent(new MouseEvent('mousedown', init(2)));
+            target.dispatchEvent(new MouseEvent('mouseup',   init(2)));
+            target.dispatchEvent(new MouseEvent('click',     init(2)));
+            target.dispatchEvent(new MouseEvent('dblclick',  init(2)));
             return { ok: true, resolved: buildStableSelector(target) };
         } else if (action === 'text') {
             return target.innerText || target.value || '';

@@ -2,14 +2,19 @@ import { createContext, useContext, useState } from 'react'
 import { BrowserRouter, Routes, Route, NavLink } from 'react-router-dom'
 import RunPage from './pages/RunPage'
 import RunDetailPage from './pages/RunDetailPage'
+import HistoryPage from './pages/HistoryPage'
 import ScriptEditor from './pages/ScriptEditor'
 
-// Shared context so RunPage can tell Sidebar which run just started —
-// no localStorage, so there's never a stale run_id from a dead server session.
-export const RunContext = createContext({ lastRunId: null, setLastRunId: () => {} })
+export const RunContext = createContext({
+  runId: null, setRunId: () => {},
+  runStatus: null, setRunStatus: () => {},
+  allSteps: [], setAllSteps: () => {},
+  latestScreenshot: null, setLatestScreenshot: () => {},
+  setLastRunId: () => {},
+})
 
 function Sidebar() {
-  const { lastRunId } = useContext(RunContext)
+  const { runId: activeRunId } = useContext(RunContext)
 
   const linkCls = ({ isActive }) =>
     `flex items-center gap-2.5 px-3 py-2 rounded-lg text-sm font-medium transition-colors ${
@@ -23,8 +28,8 @@ function Sidebar() {
       <div className="px-4 py-5">
         <div className="flex items-center gap-2.5">
           <div className="w-8 h-8 rounded-lg bg-indigo-600 flex items-center justify-center flex-shrink-0">
-            <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="currentColor" class="size-6">
-              <path fill-rule="evenodd" d="M2.25 6a3 3 0 0 1 3-3h13.5a3 3 0 0 1 3 3v12a3 3 0 0 1-3 3H5.25a3 3 0 0 1-3-3V6Zm3.97.97a.75.75 0 0 1 1.06 0l2.25 2.25a.75.75 0 0 1 0 1.06l-2.25 2.25a.75.75 0 0 1-1.06-1.06l1.72-1.72-1.72-1.72a.75.75 0 0 1 0-1.06Zm4.28 4.28a.75.75 0 0 0 0 1.5h3a.75.75 0 0 0 0-1.5h-3Z" clip-rule="evenodd" />
+            <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="currentColor" className="size-6">
+              <path fillRule="evenodd" d="M2.25 6a3 3 0 0 1 3-3h13.5a3 3 0 0 1 3 3v12a3 3 0 0 1-3 3H5.25a3 3 0 0 1-3-3V6Zm3.97.97a.75.75 0 0 1 1.06 0l2.25 2.25a.75.75 0 0 1 0 1.06l-2.25 2.25a.75.75 0 0 1-1.06-1.06l1.72-1.72-1.72-1.72a.75.75 0 0 1 0-1.06Zm4.28 4.28a.75.75 0 0 0 0 1.5h3a.75.75 0 0 0 0-1.5h-3Z" clipRule="evenodd" />
             </svg>
           </div>
           <div>
@@ -43,20 +48,21 @@ function Sidebar() {
           Run Test
         </NavLink>
 
-        {lastRunId ? (
-          <NavLink id="nav-run-detail" to={`/runs/${lastRunId}`} className={linkCls}>
-            <svg className="w-4 h-4 flex-shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 5H7a2 2 0 00-2 2v12a2 2 0 002 2h10a2 2 0 002-2V7a2 2 0 00-2-2h-2M9 5a2 2 0 002 2h2a2 2 0 002-2M9 5a2 2 0 012-2h2a2 2 0 012 2m-3 7h3m-3 4h3m-6-4h.01M9 16h.01" />
-            </svg>
-            Run Detail
+        <NavLink id="nav-history" to="/history" className={linkCls}>
+          <svg className="w-4 h-4 flex-shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 5H7a2 2 0 00-2 2v12a2 2 0 002 2h10a2 2 0 002-2V7a2 2 0 00-2-2h-2M9 5a2 2 0 002 2h2a2 2 0 002-2M9 5a2 2 0 012-2h2a2 2 0 012 2m-3 7h3m-3 4h3m-6-4h.01M9 16h.01" />
+          </svg>
+          History
+        </NavLink>
+
+        {/* Active run shortcut — only shown when a run is in progress */}
+        {activeRunId && (
+          <NavLink id="nav-active-run" to={`/runs/${activeRunId}`} className={linkCls}>
+            <span className="w-4 h-4 flex-shrink-0 flex items-center justify-center">
+              <span className="w-2 h-2 rounded-full bg-blue-400 animate-pulse" />
+            </span>
+            Active Run
           </NavLink>
-        ) : (
-          <span className="flex items-center gap-2.5 px-3 py-2 rounded-lg text-sm font-medium text-gray-700 cursor-not-allowed select-none">
-            <svg className="w-4 h-4 flex-shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 5H7a2 2 0 00-2 2v12a2 2 0 002 2h10a2 2 0 002-2V7a2 2 0 00-2-2h-2M9 5a2 2 0 002 2h2a2 2 0 002-2M9 5a2 2 0 012-2h2a2 2 0 012 2m-3 7h3m-3 4h3m-6-4h.01M9 16h.01" />
-            </svg>
-            Run Detail
-          </span>
         )}
       </nav>
 
@@ -68,15 +74,25 @@ function Sidebar() {
 }
 
 function Layout() {
-  const [lastRunId, setLastRunId] = useState(null)
+  const [runId, setRunId] = useState(null)
+  const [runStatus, setRunStatus] = useState(null)
+  const [allSteps, setAllSteps] = useState([])
+  const [latestScreenshot, setLatestScreenshot] = useState(null)
 
   return (
-    <RunContext.Provider value={{ lastRunId, setLastRunId }}>
+    <RunContext.Provider value={{
+      runId, setRunId,
+      runStatus, setRunStatus,
+      allSteps, setAllSteps,
+      latestScreenshot, setLatestScreenshot,
+      setLastRunId: setRunId,
+    }}>
       <div className="min-h-screen bg-gray-950 text-gray-100 flex">
         <Sidebar />
         <main id="main-content" className="flex-1 overflow-auto min-h-screen">
           <Routes>
             <Route path="/" element={<RunPage />} />
+            <Route path="/history" element={<HistoryPage />} />
             <Route path="/runs/:runId" element={<RunDetailPage />} />
             <Route path="/scripts/:scriptPath" element={<ScriptEditor />} />
           </Routes>

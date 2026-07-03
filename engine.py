@@ -180,15 +180,20 @@ async def execute_step(body: dict, request: Request) -> dict:
         )
         if method == "click" and any(trigger in _step_desc_lower for trigger in _TOAST_CAPTURE_TRIGGERS):
             params["capture_toast"] = True
-            params["require_toast"] = False   # don't fail the step if no toast appears — best-effort capture, not assertion
-            params["fail_on_error"] = False    # same reasoning — capture only, not validation
+            params["require_toast"] = False   # don't fail if no toast — some actions navigate directly
+            params["fail_on_error"] = True    # but if an error toast appears, fail the step
             log(sid, f"[TOAST CAPTURE] Step '{step_desc}' → arming toast capture before click")
 
         # ── smart_fix rules ──
+        _trace: list = []
+        _pre_method, _pre_params = method, {k: v for k, v in params.items() if k != "sessionId"}
         mcp_json = smart_fix_llm_output({"method": method, "params": params}, step_desc)
         method = mcp_json.get("method", method)
         params = mcp_json.get("params", params)
         params["sessionId"] = sid
+        _post_params = {k: v for k, v in params.items() if k != "sessionId"}
+        if method != _pre_method or _post_params != _pre_params:
+            _trace.append("smart_fix:changed_output")
         log(sid, f"[EXECUTE] Final params before execution: {params}")
 
         # ── Guardrail: navigate URL ──
@@ -268,6 +273,12 @@ async def execute_step(body: dict, request: Request) -> dict:
             if isinstance(executed, dict) and executed.get("error"):
                 raise RuntimeError(executed["error"])
 
+            if method == "click":
+                if isinstance(executed, dict) and executed.get("resolved_selector"):
+                    _trace.append("click:force_fallback")
+                else:
+                    _trace.append("click:native")
+
             if test_case_id and step_index:
                 try:
                     run_ts = await reports.get_run_timestamp(test_case_id)
@@ -295,7 +306,10 @@ async def execute_step(body: dict, request: Request) -> dict:
                 script_params = {k: v for k, v in params.items()}
                 if isinstance(executed, dict) and executed.get("resolved_selector"):
                     script_params["resolved_selector"] = executed["resolved_selector"]
-                await scripts.append_step(test_case_id, method, script_params, step_desc, step_index, status="passed")
+                await scripts.append_step(
+                    test_case_id, method, script_params, step_desc, step_index,
+                    status="passed", note="; ".join(_trace),
+                )
 
             report_path = None
             script_path = None
@@ -365,7 +379,10 @@ async def execute_step(body: dict, request: Request) -> dict:
                     })
 
                 if test_case_id and step_index:
-                    await scripts.append_step(test_case_id, method, dict(params), step_desc, step_index, status="failed")
+                    await scripts.append_step(
+                        test_case_id, method, dict(params), step_desc, step_index,
+                        status="failed", note="; ".join(_trace),
+                    )
 
                 report_path = None
                 script_path = None

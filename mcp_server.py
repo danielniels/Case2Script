@@ -37,6 +37,17 @@ from pydantic import BaseModel
 from playwright.async_api import async_playwright
 from starlette.middleware.base import BaseHTTPMiddleware
 
+# Force UTF-8 stdout/stderr regardless of the host OS's default console
+# codepage. Without this, any log/print containing non-ASCII characters
+# (→, ✔, etc — used throughout engine.py/runner.py log messages) crashes
+# with UnicodeEncodeError on a default Windows console (cp1252). This must
+# run before any other code that might print/log.
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(encoding="utf-8")
+    except Exception:
+        pass  # stream doesn't support reconfigure (e.g. some redirected/piped cases) — non-fatal
+
 # Import side effects — registers all cmd_* into CMD_MAP via @register_tool
 import tools        # noqa: F401
 import credentials  # noqa: F401
@@ -70,6 +81,10 @@ class SubmitReportRequest(BaseModel):
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Start Playwright once per worker; clean up on shutdown."""
+    from db import init_db
+    db_conn = await init_db()
+    app.state.db = db_conn
+
     async with async_playwright() as pw:
         app.state.pw = pw
         sessions = SessionManager()
@@ -77,13 +92,14 @@ async def lifespan(app: FastAPI):
         app.state.sessions = sessions
         app.state.reports = ReportStore()
         app.state.scripts = ScriptStore()
-        # run_registry shared with orchestrator
         from orchestrator.run_state import RunRegistry
         app.state.runs = RunRegistry()
-        print(f"[Lifespan] Playwright started.")
+        print("[Lifespan] Playwright + DB started.")
         yield
         await sessions.stop_reaper()
-    print("[Lifespan] Playwright stopped.")
+
+    await db_conn.close()
+    print("[Lifespan] Playwright + DB stopped.")
 
 
 # ==================== App ====================
@@ -293,7 +309,8 @@ async def write_script(body: _ScriptWrite):
         raise HTTPException(status_code=403, detail="Path not allowed")
     # Keep a backup of the previous version before overwriting
     if p.exists():
-        p.rename(p.with_suffix(p.suffix + ".bak"))
+        backup = p.parent / (p.stem + "(backup)" + p.suffix + ".bak")
+        p.replace(backup)
     p.parent.mkdir(parents=True, exist_ok=True)
     p.write_text(body.content, encoding="utf-8")
     return {"saved": True, "path": str(p).replace("\\", "/")}

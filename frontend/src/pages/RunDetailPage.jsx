@@ -7,6 +7,7 @@ function StatusBadge({ status }) {
     status === 'passed'    ? 'bg-green-900/60 text-green-300 border border-green-700' :
     status === 'failed'    ? 'bg-red-900/60 text-red-300 border border-red-700' :
     status === 'running'   ? 'bg-blue-900/60 text-blue-300 border border-blue-700' :
+    status === 'stopped'   ? 'bg-yellow-900/60 text-yellow-300 border border-yellow-700' :
     status === 'not_found' ? 'bg-yellow-900/60 text-yellow-300 border border-yellow-700' :
     'bg-gray-800 text-gray-400 border border-gray-700'
   return (
@@ -41,19 +42,45 @@ export default function RunDetailPage() {
     setMeta(null)
     setStepMap({})
 
-    // Always check if run exists FIRST — never subscribe to SSE for a dead runId.
     runs.get(runId)
       .then(data => {
         setMeta(data)
         setLoading(false)
 
-        // Pre-load any cached step data from this session
-        const cached = localStorage.getItem(`run_steps_${runId}`)
-        const tempMap = cached ? (() => { try { return JSON.parse(cached) } catch { return {} } })() : {}
-        if (cached) setStepMap(tempMap)
+        const isLive = data.status === 'running'
 
-        // Subscribe to SSE — replays all past events for finished runs,
-        // streams live events for running ones.
+        if (!isLive) {
+          // Completed run — load steps from DB
+          runs.steps(runId)
+            .then(res => {
+              const map = {}
+              for (const s of (res.steps || [])) {
+                map[s.step_index] = {
+                  description:     s.description,
+                  status:          s.status,
+                  screenshot_path: s.screenshot_path || null,
+                  error:           s.error || null,
+                }
+              }
+              setStepMap(map)
+            })
+            .catch(() => {
+              // Fallback to localStorage cache from the session that ran it
+              const cached = localStorage.getItem(`run_steps_${runId}`)
+              if (cached) {
+                try { setStepMap(JSON.parse(cached)) } catch { /* ignore */ }
+              }
+            })
+          return
+        }
+
+        // Live run — subscribe to SSE
+        const tempMap = (() => {
+          const cached = localStorage.getItem(`run_steps_${runId}`)
+          try { return cached ? JSON.parse(cached) : {} } catch { return {} }
+        })()
+        if (Object.keys(tempMap).length) setStepMap(tempMap)
+
         const es = runs.events(runId)
         esRef.current = es
 
@@ -63,18 +90,18 @@ export default function RunDetailPage() {
 
           if (ev.type === 'step_start') {
             tempMap[ev.step_index] = {
-              description: ev.step_description,
-              status: 'running',
+              description:     ev.step_description,
+              status:          'running',
               screenshot_path: null,
-              error: null,
+              error:           null,
             }
             setStepMap({ ...tempMap })
           } else if (ev.type === 'step_end') {
             tempMap[ev.step_index] = {
-              description: ev.step_description,
-              status: ev.ok ? 'passed' : 'failed',
+              description:     ev.step_description,
+              status:          ev.ok ? 'passed' : 'failed',
               screenshot_path: ev.screenshot_path || null,
-              error: ev.error || null,
+              error:           ev.error || null,
             }
             setStepMap({ ...tempMap })
             localStorage.setItem(`run_steps_${runId}`, JSON.stringify(tempMap))
@@ -129,15 +156,15 @@ export default function RunDetailPage() {
       <div className="p-6 space-y-4">
         <div className="flex items-center justify-between">
           <h1 className="text-xl font-semibold text-white">Run Detail</h1>
-          <button onClick={() => navigate('/')} className="text-xs text-indigo-400 hover:text-indigo-300">
-            ← Run Test
+          <button onClick={() => navigate('/history')} className="text-xs text-indigo-400 hover:text-indigo-300">
+            ← History
           </button>
         </div>
         <div className="bg-gray-900 border border-yellow-800/50 rounded-xl p-6 text-center space-y-2">
           <p className="text-yellow-400 font-semibold text-sm">Run not found</p>
           <p className="text-gray-500 text-xs font-mono">{runId}</p>
           <p className="text-gray-600 text-xs">
-            This run no longer exists in server memory (server may have restarted). Go back and start a new run.
+            This run ID does not exist in the database.
           </p>
         </div>
       </div>
@@ -159,10 +186,10 @@ export default function RunDetailPage() {
           {meta && <StatusBadge id="run-detail-status-badge" status={meta.status} />}
           <button
             id="run-detail-back-btn"
-            onClick={() => navigate('/')}
+            onClick={() => navigate('/history')}
             className="text-xs text-indigo-400 hover:text-indigo-300 transition-colors"
           >
-            ← Run Test
+            ← History
           </button>
         </div>
       </div>
@@ -220,7 +247,7 @@ export default function RunDetailPage() {
               <svg className="w-3.5 h-3.5 text-green-400" fill="none" viewBox="0 0 24 24" stroke="currentColor">
                 <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z" />
               </svg>
-              Test Report
+              Download Test Report (JSON)
             </a>
           )}
         </div>
@@ -327,7 +354,7 @@ function formatTime(ts) {
   if (!ts) return ''
   try {
     const d = typeof ts === 'number' ? new Date(ts * 1000) : new Date(ts)
-    return isNaN(d.getTime()) ? String(ts) : d.toLocaleTimeString()
+    return isNaN(d.getTime()) ? String(ts) : d.toLocaleString()
   } catch {
     return String(ts)
   }

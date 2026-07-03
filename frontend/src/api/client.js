@@ -33,8 +33,10 @@ export const suites = {
 export const runs = {
   list: () => _fetch('/runs'),
   get: (id) => _fetch(`/runs/${id}`),
+  steps: (id) => _fetch(`/runs/${id}/steps`),
   start: (body) => _fetch('/runs', { method: 'POST', body: JSON.stringify(body) }),
   stop: (id) => _fetch(`/runs/${id}/stop`, { method: 'POST' }),
+  delete: (id) => _fetch(`/runs/${id}`, { method: 'DELETE' }),
   /** Returns an EventSource connected to SSE stream */
   events: (id) => new EventSource(`/runs/${id}/events`),
 }

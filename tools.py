@@ -670,6 +670,17 @@ async def cmd_get_page_info(params: dict, session: Session):
 
 
 @register_tool(
+    "no_match",
+    "No element on the page matches this step's description. The LLM "
+    "declined to guess an element rather than risk clicking the wrong one. "
+    "This always resolves as a tracked failure, not a silent skip.",
+    {"type": "object", "properties": {}, "required": []}
+)
+async def cmd_no_match(params: dict, session: Session):
+    return {"error": "No element found matching this step's description — LLM declined to guess."}
+
+
+@register_tool(
     "close_session",
     "Close and destroy the browser session, releasing all browser resources.",
     {
@@ -765,6 +776,26 @@ async def cmd_get_interactable_elements(params: dict, session: Session):
                     input_type = await el.get_attribute("type") if tag_name == "INPUT" else None
                     input_value = await el.evaluate("e => e.value ?? null") if tag_name in ("INPUT", "TEXTAREA", "SELECT") else None
 
+                    # For inputs with no usable selector, find the nearest label text
+                    # and build a label-based XPath (handles Vue/OrangeHRM style forms)
+                    label_text = ""
+                    if not _suggested and tag_name in ("INPUT", "TEXTAREA", "SELECT"):
+                        label_text = (await el.evaluate("""e => {
+                            if (e.id) {
+                                const lbl = document.querySelector('label[for="' + e.id + '"]');
+                                if (lbl) return lbl.textContent.trim();
+                            }
+                            let node = e.parentElement;
+                            while (node && node !== document.body) {
+                                const lbl = node.querySelector('label');
+                                if (lbl) return lbl.textContent.trim();
+                                node = node.parentElement;
+                            }
+                            return '';
+                        }""") or "").strip()
+                        if label_text:
+                            _suggested = f'//label[normalize-space(.)="{label_text}"]/following::input[1]'
+
                     result.append({
                         "id": get_id, "tag": tag_name, "type": input_type, "value": input_value,
                         "text": text_content, "disabled": await el.evaluate("e => !!e.disabled"),
@@ -775,6 +806,7 @@ async def cmd_get_interactable_elements(params: dict, session: Session):
                         "aria_label": aria_label, "placeholder": placeholder,
                         "data_act": data_act, "visible": True,
                         "in_iframe": frame != session.page.main_frame,
+                        "label": label_text,
                         "suggested_selector": _suggested,
                     })
                 except Exception:
@@ -784,6 +816,7 @@ async def cmd_get_interactable_elements(params: dict, session: Session):
 
 async def cmd_click_by_index(params: dict, session: Session):
     index = params.get("index")
+    expected_text = (params.get("expected_text") or "").strip()
     if index is None:
         return {"error": "Missing required param: index"}
     elements_result = await cmd_get_interactable_elements(params, session)
@@ -791,13 +824,20 @@ async def cmd_click_by_index(params: dict, session: Session):
     if index < 0 or index >= len(elements):
         return {"error": f"Index {index} out of range", "total_elements": len(elements)}
     target = elements[index]
+    actual_text = (target.get("text") or "").strip()
+    if expected_text and actual_text != expected_text:
+        return {
+            "error": f"click_by_index drift: expected_text={expected_text!r}, "
+                     f"actual_text={actual_text!r} at index={index} — DOM order "
+                     f"shifted between prompt build and execution, refusing to click"
+        }
     selector = target.get("suggested_selector", "")
     if not selector:
         return {"error": f"Element at index {index} has no usable selector", "element": target}
     async with session.lock:
         await session.page.click(selector)
     return {"status": "clicked", "index": index, "selector": selector,
-            "element_text": target.get("text", ""), "element_tag": target.get("tag", "")}
+            "element_text": actual_text, "element_tag": target.get("tag", "")}
 
 
 def _extract_text_lines(html_content: str) -> str:
@@ -996,7 +1036,19 @@ async def cmd_double_click(params: dict, session: Session):
     sel = normalize_selector(params["selector"])
     async with session.lock:
         loc = await _find_locator(session.page, sel)
-        await loc.dblclick(timeout=params.get("timeout", 10000))
+        try:
+            await loc.dblclick(timeout=8000)
+        except (PlaywrightTimeoutError, PlaywrightError):
+            # Native actionability check failed — fall back to JS force-dblclick.
+            # Known limitation: _force_action's isVisible() does not check disabled
+            # state or pointer-events, so a disabled-but-rendered element can
+            # false-pass here. That is a pre-existing issue, out of scope for this change.
+            result = await _force_action(session.page, sel, "double_click")
+            if not result:
+                raise ValueError(
+                    f"Element not found or not double-clickable: {sel!r}. "
+                    "Use get_interactable_elements to verify the selector."
+                )
     return {"selector": sel, "double_clicked": True}
 
 
@@ -1061,9 +1113,27 @@ async def cmd_assert_text(params: dict, session: Session):
     sel = normalize_selector(params["selector"])
     expected = params["expected"]
     exact = params.get("exact", False)
+    timeout = params.get("timeout", 10000)
     async with session.lock:
         loc = await _find_locator(session.page, sel)
-        actual = (await loc.text_content(timeout=params.get("timeout", 10000)) or "").strip()
+        # Fast existence check — fail early instead of burning the full timeout on a wrong selector
+        try:
+            await loc.wait_for(state="attached", timeout=min(timeout, 5000))
+        except Exception:
+            raise AssertionError(f"assert_text failed — element not found: {sel!r}\n  expected: {expected!r}")
+        # input_value() is the correct Playwright API for <input>/<select>/<textarea>
+        actual = ""
+        try:
+            actual = (await loc.input_value(timeout=3000) or "").strip()
+        except Exception:
+            pass
+        if not actual:
+            try:
+                actual = (await loc.text_content(timeout=3000) or "").strip()
+            except Exception:
+                pass
+        if not actual:
+            actual = (await loc.evaluate("el => el.value || el.textContent || ''") or "").strip()
     match = (actual == expected) if exact else (expected in actual)
     if not match:
         raise AssertionError(
@@ -1407,6 +1477,7 @@ CMD_MAP = {
     "switch_tab": cmd_switch_tab,
     "click_by_index": cmd_click_by_index,
     "click_at_position": cmd_click_at_position,
+    "no_match": cmd_no_match,
 }
 
 VALID_METHODS = list(CMD_MAP.keys())
