@@ -445,20 +445,13 @@ def _py(s) -> str:
     return repr(str(s))
 
 
-_PY_TEMPLATES = {
-    "navigate": lambda p: (
-        f"await page.goto({_py(p.get('url',''))}, wait_until='domcontentloaded')\n"
-        f"try:\n"
-        f"    await page.wait_for_load_state('load')\n"
-        f"except Exception:\n"
-        f"    pass\n"
-        f"try:\n"
-        f"    await page.wait_for_load_state('networkidle')\n"
-        f"except Exception:\n"
-        f"    pass"
-    ),
-
-    "click": lambda p: (
+def _js_click_click_py(selector: str) -> str:
+    """One click block — same isVisible+xpath/css lookup JS used by the 'click'
+    template, parameterized on selector. Used to replay ARIA-combobox
+    select_option as two sequential real clicks (open trigger, click option)
+    instead of the native <select> Array.from(el.options) trick, which does
+    nothing on a Radix/shadcn-style combobox."""
+    return (
         f"try:\n"
         f"    await page.evaluate(\"\"\"(sel) => {{\n"
         f"  function isVisible(node) {{\n"
@@ -480,30 +473,32 @@ _PY_TEMPLATES = {
         f"      }}\n"
         f"  }}\n"
         f"  if (el) el.click();\n"
-        f"}}\"\"\", {_py(p.get('selector',''))})\n"
-        f"except Exception:\n"
-        f"    pass\n"
-        f"try:\n"
-        f"    await page.wait_for_load_state('load')\n"
-        f"except Exception:\n"
-        f"    pass\n"
-        f"try:\n"
-        f"    await page.wait_for_load_state('networkidle')\n"
+        f"}}\"\"\", {_py(selector)})\n"
         f"except Exception:\n"
         f"    pass\n"
         f"await page.wait_for_timeout(800)"
-    ),
+    )
 
-    "click_at_position": lambda p: "\n".join([
-        f"await page.locator({_py(p.get('selector', '.mapwrap svg'))}).first.click(position={{'x': {c['x']}, 'y': {c['y']}}})\n"
-        f"await page.wait_for_timeout(300)"
-        for c in (p.get('clicks') or [{"x": p.get('x', 0), "y": p.get('y', 0)}])
-    ]),
 
-    "fill": lambda p:
-        f"await page.locator({_py(p.get('selector',''))}).first.fill({_py(p.get('text',''))})",
+def _select_option_py(p: dict) -> str:
+    if p.get("resolved_via") == "aria_combobox":
+        trigger = p.get("trigger_selector") or p.get("selector", "")
+        option_sel = p.get("option_selector")
+        if not option_sel:
+            return (
+                f"# select_option (ARIA combobox) — matched option text could not be\n"
+                f"# safely converted to an XPath selector (likely contains a `\"` character).\n"
+                f"# MANUAL FIX NEEDED: open {_py(trigger)} and click the option for "
+                f"value={_py(p.get('value', ''))} by hand."
+            )
+        return (
+            _js_click_click_py(trigger)
+            + "\n"
+            + _js_click_click_py(option_sel)
+        )
 
-    "select_option": lambda p: (
+    # Select2 / native <select> path — unchanged.
+    return (
         f"await page.evaluate(\"\"\"({{sel, val}}) => {{\n"
         f"  function isVisible(node) {{\n"
         f"    const s = window.getComputedStyle(node);\n"
@@ -533,7 +528,84 @@ _PY_TEMPLATES = {
         f"  el.dispatchEvent(new Event('input', {{ bubbles: true }}));\n"
         f"  return true;\n"
         f"}}\"\"\", {{'sel': {_py(p.get('selector',''))}, 'val': {_py(p.get('value',''))}}})"
+    )
+
+
+_PY_TEMPLATES = {
+    "navigate": lambda p: (
+        f"await page.goto({_py(p.get('url',''))}, wait_until='domcontentloaded')\n"
+        f"try:\n"
+        f"    await page.wait_for_load_state('load')\n"
+        f"except Exception:\n"
+        f"    pass\n"
+        f"try:\n"
+        f"    await page.wait_for_load_state('networkidle')\n"
+        f"except Exception:\n"
+        f"    pass"
     ),
+
+    "click": lambda p: (
+        f"_clicked = False\n"
+        f"try:\n"
+        f"    await page.locator({_py(p.get('selector',''))}).first.click(timeout=6000)\n"
+        f"    _clicked = True\n"
+        f"except Exception as _e:\n"
+        f"    print(f'[click] native click failed ({{type(_e).__name__}}), trying JS fallback')\n"
+        f"if not _clicked:\n"
+        f"    _result = await page.evaluate(\"\"\"(sel) => {{\n"
+        f"  function isVisible(node) {{\n"
+        f"    const s = window.getComputedStyle(node);\n"
+        f"    return s.display !== 'none' && s.visibility !== 'hidden' && node.offsetParent !== null;\n"
+        f"  }}\n"
+        f"  let el;\n"
+        f"  const xsel = sel.startsWith('xpath=') ? sel.slice(6) : sel;\n"
+        f"  if (xsel.startsWith('//')) {{\n"
+        f"      const r = document.evaluate(xsel, document, null, XPathResult.ORDERED_NODE_SNAPSHOT_TYPE, null);\n"
+        f"      for (let i = 0; i < r.snapshotLength; i++) {{\n"
+        f"          const node = r.snapshotItem(i);\n"
+        f"          if (isVisible(node)) {{ el = node; break; }}\n"
+        f"      }}\n"
+        f"  }} else {{\n"
+        f"      const nodes = document.querySelectorAll(xsel);\n"
+        f"      for (const node of nodes) {{\n"
+        f"          if (isVisible(node)) {{ el = node; break; }}\n"
+        f"      }}\n"
+        f"  }}\n"
+        f"  if (!el) return {{found: false}};\n"
+        f"  const disabled = el.disabled || el.getAttribute('aria-disabled') === 'true' || getComputedStyle(el).pointerEvents === 'none';\n"
+        f"  if (disabled) return {{found: true, disabled: true}};\n"
+        f"  el.click();\n"
+        f"  return {{found: true, disabled: false, clicked: true}};\n"
+        f"}}\"\"\", {_py(p.get('selector',''))})\n"
+        f"    print(f'[click] JS fallback result: {{_result}}')\n"
+        f"    if not _result.get('clicked'):\n"
+        f"        raise ValueError(f'click failed for selector — {{_result}}')\n"
+        f"try:\n"
+        f"    await page.wait_for_load_state('load')\n"
+        f"except Exception:\n"
+        f"    pass\n"
+        f"try:\n"
+        f"    await page.wait_for_load_state('networkidle')\n"
+        f"except Exception:\n"
+        f"    pass\n"
+        f"await page.wait_for_timeout(400)"
+    ),
+
+    "click_at_position": lambda p: "\n".join([
+        f"await page.locator({_py(p.get('selector', '.mapwrap svg'))}).first.click(position={{'x': {c['x']}, 'y': {c['y']}}})\n"
+        f"await page.wait_for_timeout(300)"
+        for c in (p.get('clicks') or [{"x": p.get('x', 0), "y": p.get('y', 0)}])
+    ]),
+
+    "fill": lambda p: (
+        f"try:\n"
+        f"    await page.locator({_py(p.get('selector',''))}).first.fill({_py(p.get('text',''))})\n"
+        f"except Exception:\n"
+        f"    await page.screenshot(path=f'{{SCREENSHOT_DIR}}/FAILED.png')\n"
+        f"    raise"
+    ),
+
+    "select_option": _select_option_py,
 
     "press_key": lambda p: (
         f"await page.keyboard.press({_py(p.get('key','Escape'))})\n"

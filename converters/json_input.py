@@ -56,8 +56,14 @@ def _normalize_case(tc: dict, suite_id: str) -> dict:
         "test_case_id": tc_id,
         "test_case_name": tc_name,
         "test_suite_id": suite_id,
+        "case_type": normalize_case_type(tc.get("case_type") or tc.get("type") or tc.get("tc_type")),
         "steps": [_normalize_step(s, i + 1) for i, s in enumerate(steps)],
     }
+
+
+def normalize_case_type(value) -> str:
+    """Collapse any positive/negative spelling to a canonical value. Defaults to 'positive'."""
+    return "negative" if str(value or "").strip().lower().startswith("neg") else "positive"
 
 
 def _normalize_step(s: dict, index: int) -> dict:

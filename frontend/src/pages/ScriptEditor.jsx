@@ -1,5 +1,8 @@
 import { useEffect, useState } from 'react'
 import { useParams, useNavigate } from 'react-router-dom'
+import CodeMirror from '@uiw/react-codemirror'
+import { python } from '@codemirror/lang-python'
+import { oneDark } from '@codemirror/theme-one-dark'
 import { scripts } from '../api/client'
 
 function Spinner() {
@@ -17,6 +20,7 @@ export default function ScriptEditor() {
   const decoded = decodeURIComponent(scriptPath || '')
 
   const [code, setCode]             = useState('')
+  const [absPath, setAbsPath]       = useState('')
   const [loading, setLoading]       = useState(true)
   const [saving, setSaving]         = useState(false)
   const [toast, setToast]           = useState(null)   // { type: 'success'|'error', msg }
@@ -27,13 +31,15 @@ export default function ScriptEditor() {
   const [runResult, setRunResult]   = useState(null)   // { ok, exit_code, stdout, stderr, screenshot_dir, timed_out }
   const [screenshots, setScreenshots] = useState([])   // [{ name, url }]
   const [logExpanded, setLogExpanded] = useState(true)
+  const [logCopied, setLogCopied]   = useState(false)
+  const [codeCopied, setCodeCopied] = useState(false)
   const [lightbox, setLightbox]     = useState(null)   // url string
 
   useEffect(() => {
     if (!decoded) return
     setLoading(true)
     scripts.get(decoded)
-      .then(d => { setCode(d.content || ''); setLoading(false) })
+      .then(d => { setCode(d.content || ''); setAbsPath(d.path || ''); setLoading(false) })
       .catch(err => {
         setCode('# Could not load script')
         setLoading(false)
@@ -103,10 +109,33 @@ export default function ScriptEditor() {
   }
 
   const filename = decoded.replace(/\\/g, '/').split('/').pop()
+  const vscodeUrl = absPath ? `vscode://file/${absPath.replace(/\\/g, '/')}` : null
   const logOutput = [
     runResult?.stdout,
     runResult?.stderr ? '--- stderr ---\n' + runResult.stderr : '',
   ].filter(Boolean).join('\n').trim()
+
+  async function handleCopyLog() {
+    if (!logOutput) return
+    try {
+      await navigator.clipboard.writeText(logOutput)
+      setLogCopied(true)
+      setTimeout(() => setLogCopied(false), 1500)
+    } catch (err) {
+      showToast('error', 'Copy failed')
+    }
+  }
+
+  async function handleCopyCode() {
+    if (!code) return
+    try {
+      await navigator.clipboard.writeText(code)
+      setCodeCopied(true)
+      setTimeout(() => setCodeCopied(false), 1500)
+    } catch (err) {
+      showToast('error', 'Copy failed')
+    }
+  }
 
   return (
     <div className="p-6 space-y-4 min-h-screen bg-gray-950 text-gray-100">
@@ -146,17 +175,21 @@ export default function ScriptEditor() {
           <p className="text-gray-500 text-sm">Loading script…</p>
         </div>
       ) : (
-        <textarea
-          className={`w-full bg-gray-900 text-green-300 font-mono text-xs rounded-lg p-4 resize-none border border-gray-700 focus:outline-none focus:border-indigo-500 transition-colors leading-relaxed ${
-            runResult ? 'h-[40vh]' : 'h-[65vh]'
-          }`}
-          value={code}
-          onChange={e => { setCode(e.target.value); setEdited(true) }}
-          spellCheck={false}
-          autoComplete="off"
-          autoCorrect="off"
-          autoCapitalize="off"
-        />
+        <div
+          className="rounded-lg border border-gray-700 focus-within:border-indigo-500 transition-colors overflow-auto resize-y"
+          style={{ height: runResult ? '55vh' : '82vh', minHeight: '180px', maxHeight: '95vh' }}
+          title="Drag the bottom-right corner to resize"
+        >
+          <CodeMirror
+            value={code}
+            height="100%"
+            theme={oneDark}
+            extensions={[python()]}
+            onChange={value => { setCode(value); setEdited(true) }}
+            basicSetup={{ lineNumbers: true, foldGutter: true, tabSize: 4 }}
+            style={{ fontSize: '13px', height: '100%' }}
+          />
+        </div>
       )}
 
       {/* Action bar */}
@@ -199,6 +232,37 @@ export default function ScriptEditor() {
           Download .py
         </a>
 
+        {vscodeUrl && (
+          <a
+            href={vscodeUrl}
+            title="Opens this file in your local VS Code — requires VS Code installed on this machine"
+            className="flex items-center gap-1.5 px-4 py-2 bg-gray-800 hover:bg-gray-700 rounded-lg text-sm text-gray-300 transition-colors"
+          >
+            <svg className="w-3.5 h-3.5 text-blue-400" fill="currentColor" viewBox="0 0 24 24">
+              <path d="M17.5 2.5l-8.4 7.7L4.9 7 3 8l4 4-4 4 1.9 1 4.2-3.2 8.4 7.7L21 20V4l-3.5-1.5zM17 17.4l-6.1-5.4L17 6.6v10.8z" />
+            </svg>
+            Open in VS Code
+          </a>
+        )}
+
+        <button
+          disabled={loading || !code}
+          onClick={handleCopyCode}
+          className="flex items-center gap-1.5 px-4 py-2 bg-gray-800 hover:bg-gray-700 disabled:opacity-50 disabled:cursor-not-allowed rounded-lg text-sm text-gray-300 transition-colors"
+        >
+          {codeCopied ? (
+            '✓ Copied'
+          ) : (
+            <>
+              <svg className="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2}
+                  d="M8 16H6a2 2 0 01-2-2V6a2 2 0 012-2h8a2 2 0 012 2v2m-6 12h8a2 2 0 002-2v-8a2 2 0 00-2-2h-8a2 2 0 00-2 2v8a2 2 0 002 2z" />
+              </svg>
+              Copy code
+            </>
+          )}
+        </button>
+
         <span className="text-xs text-gray-600 ml-auto font-mono truncate hidden sm:block">{decoded}</span>
       </div>
 
@@ -239,18 +303,27 @@ export default function ScriptEditor() {
 
           {/* Output log */}
           <div className="border border-gray-700 rounded-lg overflow-hidden">
-            <button
-              onClick={() => setLogExpanded(v => !v)}
-              className="w-full flex items-center justify-between px-4 py-2.5 bg-gray-800 hover:bg-gray-700 text-xs text-gray-400 transition-colors"
-            >
-              <span className="font-semibold uppercase tracking-wide">Output log</span>
-              <svg
-                className={`w-4 h-4 transition-transform ${logExpanded ? 'rotate-180' : ''}`}
-                fill="none" viewBox="0 0 24 24" stroke="currentColor"
+            <div className="w-full flex items-center justify-between px-4 py-2.5 bg-gray-800 text-xs text-gray-400">
+              <button
+                onClick={() => setLogExpanded(v => !v)}
+                className="flex items-center gap-2 flex-1 min-w-0 hover:text-gray-200 transition-colors"
               >
-                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 9l-7 7-7-7" />
-              </svg>
-            </button>
+                <span className="font-semibold uppercase tracking-wide">Output log</span>
+                <svg
+                  className={`w-4 h-4 transition-transform ${logExpanded ? 'rotate-180' : ''}`}
+                  fill="none" viewBox="0 0 24 24" stroke="currentColor"
+                >
+                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 9l-7 7-7-7" />
+                </svg>
+              </button>
+              <button
+                onClick={handleCopyLog}
+                disabled={!logOutput}
+                className="flex-shrink-0 px-2 py-1 rounded hover:bg-gray-700 hover:text-gray-200 disabled:opacity-40 disabled:cursor-not-allowed transition-colors"
+              >
+                {logCopied ? '✓ Copied' : 'Copy'}
+              </button>
+            </div>
             {logExpanded && (
               <pre className="p-4 font-mono text-xs text-gray-300 bg-gray-900 overflow-auto max-h-56 whitespace-pre-wrap break-words">
                 {logOutput || '(no output)'}

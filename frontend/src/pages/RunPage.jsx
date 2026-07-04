@@ -101,6 +101,9 @@ export default function RunPage() {
   const [convertError, setConvertError] = useState(null)
   const [suite, setSuite]             = useState(null)
   const [selectedTcIdx, setSelectedTcIdx] = useState(0)
+  const [editingSteps, setEditingSteps] = useState(false)
+  const [dragIndex, setDragIndex]     = useState(null)
+  const [stepsCopied, setStepsCopied] = useState(false)
 
   // ── Run state (local only — timer display) ─────────────────────────────────
   const [isStarting, setIsStarting]   = useState(false)
@@ -228,11 +231,15 @@ export default function RunPage() {
     setSuite(null)
     setConvertError(null)
     setParseError(null)
+    setEditingSteps(false)
+    setDragIndex(null)
   }
 
   async function handleConvert() {
     setConvertError(null)
     setSuite(null)
+    setEditingSteps(false)
+    setDragIndex(null)
     setConverting(true)
     try {
       const result = inputMode === 'excel'
@@ -245,6 +252,112 @@ export default function RunPage() {
     } finally {
       setConverting(false)
     }
+  }
+
+  // Mutates the currently selected test case's steps (used by the step editor)
+  function updateStep(idx, field, value) {
+    setSuite(prev => {
+      if (!prev) return prev
+      return {
+        ...prev,
+        test_cases: prev.test_cases.map((tc, i) =>
+          i !== selectedTcIdx ? tc : {
+            ...tc,
+            steps: tc.steps.map((s, j) => j !== idx ? s : { ...s, [field]: value }),
+          }
+        ),
+      }
+    })
+  }
+
+  function updateCaseType(value) {
+    setSuite(prev => {
+      if (!prev) return prev
+      return {
+        ...prev,
+        test_cases: prev.test_cases.map((tc, i) =>
+          i !== selectedTcIdx ? tc : { ...tc, case_type: value }
+        ),
+      }
+    })
+  }
+
+  function reorderStep(fromIdx, toIdx) {
+    if (fromIdx === toIdx) return
+    setSuite(prev => {
+      if (!prev) return prev
+      return {
+        ...prev,
+        test_cases: prev.test_cases.map((tc, i) => {
+          if (i !== selectedTcIdx) return tc
+          const steps = [...tc.steps]
+          const [moved] = steps.splice(fromIdx, 1)
+          steps.splice(toIdx, 0, moved)
+          return { ...tc, steps }
+        }),
+      }
+    })
+  }
+
+  function handleDragStart(e, idx) {
+    setDragIndex(idx)
+    e.dataTransfer.effectAllowed = 'move'
+    e.dataTransfer.setData('text/plain', String(idx))
+  }
+
+  function handleDragOver(e) {
+    e.preventDefault()
+    e.dataTransfer.dropEffect = 'move'
+  }
+
+  function handleDrop(e, idx) {
+    e.preventDefault()
+    if (dragIndex !== null) reorderStep(dragIndex, idx)
+    setDragIndex(null)
+  }
+
+  async function handleCopySteps() {
+    if (!selectedTc) return
+    // Numbered list — same shape as the Prompt textarea, so it pastes back in
+    // and re-parses instantly via the regex fast path (no LLM round-trip).
+    const text = selectedTc.steps
+      .map((s, i) => `${i + 1}. ${s.test_step_description}`)
+      .join('\n')
+    try {
+      await navigator.clipboard.writeText(text)
+      setStepsCopied(true)
+      setTimeout(() => setStepsCopied(false), 1500)
+    } catch {
+      setConvertError('Copy failed')
+    }
+  }
+
+  function removeStep(idx) {
+    setSuite(prev => {
+      if (!prev) return prev
+      return {
+        ...prev,
+        test_cases: prev.test_cases.map((tc, i) =>
+          i !== selectedTcIdx ? tc : { ...tc, steps: tc.steps.filter((_, j) => j !== idx) }
+        ),
+      }
+    })
+  }
+
+  function addStep() {
+    setSuite(prev => {
+      if (!prev) return prev
+      return {
+        ...prev,
+        test_cases: prev.test_cases.map((tc, i) => {
+          if (i !== selectedTcIdx) return tc
+          return {
+            ...tc,
+            steps: [...tc.steps, { test_step_id: String(tc.steps.length + 1), test_step_description: '', expected_result: '' }],
+          }
+        }),
+      }
+    })
   }
 
   const handleStart = async () => {
@@ -493,9 +606,29 @@ export default function RunPage() {
           <div id="suite-preview" className="bg-gray-950 border border-gray-700 rounded-lg p-3 space-y-2">
             <div className="flex items-center justify-between gap-2">
               <p className="text-xs text-gray-300 font-semibold truncate">{suite.name}</p>
-              {suite.test_cases.length > 1 && (
-                <span className="text-xs text-gray-600 flex-shrink-0">{suite.test_cases.length} test cases</span>
-              )}
+              <div className="flex items-center gap-2 flex-shrink-0">
+                {suite.test_cases.length > 1 && (
+                  <span className="text-xs text-gray-600">{suite.test_cases.length} test cases</span>
+                )}
+                <button
+                  id="copy-steps-btn"
+                  onClick={handleCopySteps}
+                  title="Copy as numbered text (paste back into Prompt to reuse)"
+                  className="text-xs font-medium px-2 py-1 rounded bg-gray-800 text-gray-400 hover:text-gray-200 transition-colors"
+                >
+                  {stepsCopied ? '✓ Copied' : 'Copy'}
+                </button>
+                <button
+                  id="edit-steps-btn"
+                  onClick={() => setEditingSteps(v => !v)}
+                  disabled={isRunning}
+                  className={`text-xs font-medium px-2 py-1 rounded transition-colors disabled:opacity-40 disabled:cursor-not-allowed ${
+                    editingSteps ? 'bg-indigo-600 text-white hover:bg-indigo-500' : 'bg-gray-800 text-gray-400 hover:text-gray-200'
+                  }`}
+                >
+                  {editingSteps ? 'Done' : 'Edit'}
+                </button>
+              </div>
             </div>
 
             {suite.test_cases.length > 1 && (
@@ -505,19 +638,95 @@ export default function RunPage() {
                 className="w-full bg-gray-900 border border-gray-700 rounded px-2 py-1.5 text-xs text-gray-300 focus:outline-none focus:border-indigo-500"
               >
                 {suite.test_cases.map((tc, i) => (
-                  <option key={i} value={i}>{tc.test_case_id} — {tc.test_case_name}</option>
+                  <option key={i} value={i}>
+                    {tc.case_type === 'negative' ? '🔴' : '🟢'} {tc.test_case_id} — {tc.test_case_name}
+                  </option>
                 ))}
               </select>
             )}
 
-            <div className="max-h-28 overflow-y-auto space-y-0.5">
+            {selectedTc && (
+              <div className="flex items-center gap-2">
+                <span className="text-xs text-gray-600">Case type:</span>
+                <button
+                  id="case-type-positive-btn"
+                  onClick={() => updateCaseType('positive')}
+                  className={`text-xs font-bold px-2.5 py-1 rounded-full transition-colors ${
+                    (selectedTc.case_type || 'positive') === 'positive'
+                      ? 'bg-green-700 text-white'
+                      : 'bg-gray-800 text-gray-500 hover:text-gray-300'
+                  }`}
+                >
+                  POSITIVE
+                </button>
+                <button
+                  id="case-type-negative-btn"
+                  onClick={() => updateCaseType('negative')}
+                  className={`text-xs font-bold px-2.5 py-1 rounded-full transition-colors ${
+                    selectedTc.case_type === 'negative'
+                      ? 'bg-red-700 text-white'
+                      : 'bg-gray-800 text-gray-500 hover:text-gray-300'
+                  }`}
+                >
+                  NEGATIVE
+                </button>
+              </div>
+            )}
+
+            <div className={`overflow-y-auto space-y-1 ${editingSteps ? 'max-h-72' : 'max-h-28 space-y-0.5'}`}>
               {selectedTc?.steps.map((step, i) => (
-                <div key={i} className="flex gap-2 text-xs">
-                  <span className="text-gray-600 font-mono flex-shrink-0 w-5 text-right">{i + 1}.</span>
-                  <span className="text-gray-400">{step.test_step_description}</span>
-                </div>
+                editingSteps ? (
+                  <div
+                    key={i}
+                    onDragOver={handleDragOver}
+                    onDrop={e => handleDrop(e, i)}
+                    className={`flex items-start gap-1.5 text-xs bg-gray-900 border rounded p-1.5 transition-colors ${
+                      dragIndex === i ? 'opacity-40 border-indigo-500' : 'border-gray-800'
+                    }`}
+                  >
+                    <span className="text-gray-600 font-mono flex-shrink-0 w-5 text-right pt-1.5">{i + 1}.</span>
+                    <span
+                      draggable
+                      onDragStart={e => handleDragStart(e, i)}
+                      onDragEnd={() => setDragIndex(null)}
+                      title="Drag to reorder"
+                      className="cursor-grab active:cursor-grabbing text-gray-600 hover:text-gray-300 flex-shrink-0 pt-1 select-none"
+                    >
+                      ⠿
+                    </span>
+                    <textarea
+                      value={step.test_step_description}
+                      onChange={e => updateStep(i, 'test_step_description', e.target.value)}
+                      rows={1}
+                      placeholder="Step description"
+                      className="flex-1 min-w-0 bg-gray-950 border border-gray-700 rounded px-2 py-1 text-gray-300 resize-y focus:outline-none focus:border-indigo-500"
+                    />
+                    <button
+                      onClick={() => removeStep(i)}
+                      title="Remove step"
+                      className="text-gray-600 hover:text-red-400 flex-shrink-0 px-1 pt-1"
+                    >
+                      ✕
+                    </button>
+                  </div>
+                ) : (
+                  <div key={i} className="flex gap-2 text-xs">
+                    <span className="text-gray-600 font-mono flex-shrink-0 w-5 text-right">{i + 1}.</span>
+                    <span className="text-gray-400">{step.test_step_description}</span>
+                  </div>
+                )
               ))}
             </div>
+
+            {editingSteps && (
+              <button
+                id="add-step-btn"
+                onClick={addStep}
+                className="text-xs text-indigo-400 hover:text-indigo-300 font-medium"
+              >
+                + Add step
+              </button>
+            )}
 
             <p className="text-xs text-green-500">
               ✓ {selectedTc?.steps.length} steps ready — {selectedTc?.test_case_id}

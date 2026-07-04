@@ -91,11 +91,15 @@ def _atomic_write(path: Path, data: dict):
 
 
 def _summary(data: dict, suite_id: str) -> dict:
+    cases = data.get("test_cases", [])
+    negative_count = sum(1 for tc in cases if tc.get("case_type") == "negative")
     return {
         "id": data.get("id", suite_id),
         "name": data.get("name", suite_id),
         "description": data.get("description", ""),
-        "test_case_count": len(data.get("test_cases", [])),
+        "test_case_count": len(cases),
+        "positive_count": len(cases) - negative_count,
+        "negative_count": negative_count,
         "created_at": data.get("created_at"),
         "updated_at": data.get("updated_at"),
     }

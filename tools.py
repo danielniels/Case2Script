@@ -12,6 +12,9 @@ from datetime import datetime
 from io import StringIO
 from pathlib import Path
 from typing import Any, Callable, Dict, Optional
+from orchestrator.prompts import _relevance_score  # verify no circular import — prompts.py must not import from tools.py
+import uuid
+
 
 import pandas as pd
 from bs4 import BeautifulSoup
@@ -166,6 +169,166 @@ _CLASSIFY_JS = """(sel) => { const el=document.querySelector(sel); if(!el) retur
 
 # ==================== Command Handlers ====================
 
+async def _aria_combobox_pick(page, sel: str, value: str) -> dict:
+    """Returns {"success", "trigger_selector", "option_xpath", "matched_text"}.
+    option_xpath/matched_text are only populated when success is True — codegen
+    uses option_xpath to replay the exact option click without re-deriving it."""
+    marker = f"pending-{uuid.uuid4().hex[:8]}"
+
+    combo = await page.evaluate("""
+        (args) => {
+            const [sel, marker] = args;
+            function isVisible(node) {
+                const s = window.getComputedStyle(node);
+                return s.display !== 'none' && s.visibility !== 'hidden' && node.offsetParent !== null;
+            }
+            let el = null;
+            if (sel.startsWith('//') || sel.startsWith('xpath=')) {
+                const xsel = sel.replace('xpath=', '');
+                const r = document.evaluate(xsel, document, null, XPathResult.ORDERED_NODE_SNAPSHOT_TYPE, null);
+                for (let i = 0; i < r.snapshotLength; i++) {
+                    const node = r.snapshotItem(i);
+                    if (isVisible(node)) { el = node; break; }
+                }
+            } else {
+                const nodes = document.querySelectorAll(sel);
+                for (const node of nodes) {
+                    if (isVisible(node)) { el = node; break; }
+                }
+            }
+            if (!el) return null;
+            const role = el.getAttribute('role');
+            const hasPopup = el.getAttribute('aria-haspopup');
+            if (role !== 'combobox' && hasPopup !== 'listbox') return null;
+
+            el.setAttribute('data-c2s-target', marker);
+
+            return {
+                isOpen: el.getAttribute('data-state') === 'open' || el.getAttribute('aria-expanded') === 'true',
+                listboxId: el.getAttribute('aria-controls') || null,
+            };
+        }
+    """, [sel, marker])
+    if combo is None:
+        return {"success": False, "trigger_selector": sel, "option_xpath": None, "matched_text": None}
+
+    # Scope to this trigger's own listbox when we know its id. Falls back
+    # to a global query only if aria-controls isn't present — that fallback
+    # still carries the stale-hidden-listbox risk this bug just exposed.
+    listbox_id = combo.get("listboxId")
+    if listbox_id:
+        option_selector = f'[id="{listbox_id}"] [role="option"]'
+    else:
+        option_selector = '[role="listbox"] [role="option"]'
+
+    clicked = False
+    matched_text = None
+    option_xpath = None
+    try:
+        if not combo["isOpen"]:
+            opened = await _force_action(page, sel, "click")
+            if not opened:
+                return {"success": False, "trigger_selector": sel, "option_xpath": None, "matched_text": None}
+            await page.wait_for_timeout(200)
+
+        await page.wait_for_selector(option_selector, timeout=3000, state="visible")
+        options = page.locator(option_selector)
+        count = await options.count()
+        norm_value = value.strip().lower()
+
+        target = None
+        for i in range(count):
+            text = (await options.nth(i).inner_text()).strip()
+            if text.lower() == norm_value:
+                target = options.nth(i)
+                matched_text = text
+                break
+        if target is None:
+            for i in range(count):
+                text = (await options.nth(i).inner_text()).strip()
+                if norm_value in text.lower():
+                    target = options.nth(i)
+                    matched_text = text
+                    break
+
+        if target is None:
+            return {"success": False, "trigger_selector": sel, "option_xpath": None, "matched_text": None}
+
+        # Build a re-locatable XPath for this exact option now, while we still
+        # know which one matched — codegen replays this as a second click.
+        # A `"` in matched_text would break the double-quoted XPath string
+        # literal below; no XPath-escaping helper exists in this codebase, so
+        # skip building it rather than emit a broken selector (caller/codegen
+        # falls back to a manual-fix comment when option_xpath is None).
+        if '"' in matched_text:
+            option_xpath = None
+        elif listbox_id:
+            option_xpath = (
+                f'//*[@id="{listbox_id}"]//*[@role="option"]'
+                f'[normalize-space(.) = "{matched_text}"]'
+            )
+        else:
+            option_xpath = f'//*[@role="option"][normalize-space(.) = "{matched_text}"]'
+
+        await target.click(timeout=3000)
+        clicked = True
+
+        confirmed = False
+        last_seen = None
+        deadline = asyncio.get_event_loop().time() + 5
+        while asyncio.get_event_loop().time() < deadline:
+            try:
+                last_seen = await page.evaluate(
+                    """(marker) => {
+                        const el = document.querySelector(`[data-c2s-target="${marker}"]`);
+                        return el ? el.innerText.trim() : null;
+                    }""",
+                    marker,
+                )
+            except PlaywrightError as nav_err:
+                if "Execution context was destroyed" in str(nav_err) or "navigation" in str(nav_err).lower():
+                    try:
+                        await page.wait_for_load_state("load", timeout=8000)
+                    except Exception:
+                        pass
+                    await page.wait_for_timeout(300)
+                    continue
+                raise
+
+            if last_seen and norm_value in last_seen.lower():
+                confirmed = True
+                break
+            await page.wait_for_timeout(150)
+
+        if not confirmed:
+            print(f"[ARIA combobox] selected '{value}' but trigger never confirmed it — last seen: {last_seen!r}")
+
+    except PlaywrightTimeoutError:
+        clicked = False
+    finally:
+        try:
+            await page.evaluate(
+                """(marker) => {
+                    const el = document.querySelector(`[data-c2s-target="${marker}"]`);
+                    if (el) el.removeAttribute('data-c2s-target');
+                }""",
+                marker,
+            )
+        except Exception:
+            pass
+
+    if not clicked:
+        try:
+            await page.keyboard.press("Escape")
+        except Exception:
+            pass
+    return {
+        "success": clicked,
+        "trigger_selector": sel,
+        "option_xpath": option_xpath if clicked else None,
+        "matched_text": matched_text if clicked else None,
+    }
+
 @register_tool(
     "select_option",
     "Select an option from a native <select> dropdown or a Select2 custom widget by value or visible text.",
@@ -182,8 +345,12 @@ _CLASSIFY_JS = """(sel) => { const el=document.querySelector(sel); if(!el) retur
 async def cmd_select_option(params: dict, session: Session):
     sel = normalize_selector(params["selector"])
     value = params.get("value", "") or params.get("text", "")
+    aria_result = None
     async with session.lock:
         handled = await _select2_pick(session.page, sel, value)
+        if not handled:
+            aria_result = await _aria_combobox_pick(session.page, sel, value)
+            handled = aria_result["success"]
         if not handled:
             is_select = await session.page.evaluate("""
                 (sel) => {
@@ -216,9 +383,16 @@ async def cmd_select_option(params: dict, session: Session):
                 except Exception:
                     await session.page.select_option(sel, value=value)
             else:
-                raise Exception(f"select_option failed: could not find Select2 or native <select> for value='{value}'")
+                raise Exception(f"select_option failed: could not find Select2, ARIA combobox, or native <select> for value='{value}'")
         await asyncio.sleep(0.5)
-    return {"selector": sel, "value": value}
+
+    result = {"selector": sel, "value": value}
+    if aria_result and aria_result["success"]:
+        result["resolved_via"] = "aria_combobox"
+        result["trigger_selector"] = aria_result["trigger_selector"]
+        if aria_result.get("option_xpath"):
+            result["option_selector"] = aria_result["option_xpath"]
+    return result
 
 
 @register_tool(
@@ -763,8 +937,10 @@ async def cmd_get_interactable_elements(params: dict, session: Session):
                         _suggested = f'xpath=//{tag_name.lower()}[@aria-label="{aria_label}"]'
                     elif placeholder:
                         _suggested = f'xpath=//{tag_name.lower()}[@placeholder="{placeholder}"]'
-                    elif direct_text:
-                        _suggested = f'xpath=//{tag_name.lower()}[text()[normalize-space(.) = "{direct_text}"]]'
+                    elif direct_text or text_content:
+                        source_text = direct_text or text_content
+                        first_line = source_text.split('\n')[0].strip()
+                        _suggested = f'xpath=//{tag_name.lower()}[.//text()[normalize-space(.) = "{first_line}"]]' if first_line else ""
                     elif data_act and tag_name not in ("BUTTON", "A", "INPUT", "SELECT", "TEXTAREA"):
                         _suggested = f'xpath=//{tag_name.lower()}[@data-act="{data_act}" and .//*[normalize-space(.) = "{text_content.split(chr(10))[0].strip()}"]]'
                     elif text_content:
@@ -814,9 +990,11 @@ async def cmd_get_interactable_elements(params: dict, session: Session):
     return {"count": len(result), "elements": result}
 
 
+
 async def cmd_click_by_index(params: dict, session: Session):
     index = params.get("index")
     expected_text = (params.get("expected_text") or "").strip()
+    step_description = (params.get("step_description") or "").strip()  # needs to be threaded through from the caller
     if index is None:
         return {"error": "Missing required param: index"}
     elements_result = await cmd_get_interactable_elements(params, session)
@@ -825,19 +1003,38 @@ async def cmd_click_by_index(params: dict, session: Session):
         return {"error": f"Index {index} out of range", "total_elements": len(elements)}
     target = elements[index]
     actual_text = (target.get("text") or "").strip()
+
     if expected_text and actual_text != expected_text:
         return {
             "error": f"click_by_index drift: expected_text={expected_text!r}, "
                      f"actual_text={actual_text!r} at index={index} — DOM order "
                      f"shifted between prompt build and execution, refusing to click"
         }
+
+    # NEW: index was structurally valid, now check it's actually relevant to the step
+    score = None
+    if step_description:
+        score = _relevance_score(step_description, target)
+
+        # --- TEMP: log every score during the tuning window ---
+        print(f"[click_by_index relevance] step={step_description!r} idx={index} text={actual_text!r} score={score}")
+        # -------------------------------------------------------
+
+        if score <= 0:
+            return {
+                "error": f"click_by_index refused: element at index={index} "
+                         f"(text={actual_text!r}) scored {score} relevance against "
+                         f"step {step_description!r} — likely wrong target, not clicking blind"
+            }
+            
     selector = target.get("suggested_selector", "")
     if not selector:
         return {"error": f"Element at index {index} has no usable selector", "element": target}
     async with session.lock:
         await session.page.click(selector)
     return {"status": "clicked", "index": index, "selector": selector,
-            "element_text": actual_text, "element_tag": target.get("tag", "")}
+            "element_text": actual_text, "element_tag": target.get("tag", ""),
+            "relevance_score": score if step_description else None}
 
 
 def _extract_text_lines(html_content: str) -> str:

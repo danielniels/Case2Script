@@ -306,6 +306,11 @@ async def execute_step(body: dict, request: Request) -> dict:
                 script_params = {k: v for k, v in params.items()}
                 if isinstance(executed, dict) and executed.get("resolved_selector"):
                     script_params["resolved_selector"] = executed["resolved_selector"]
+                if isinstance(executed, dict) and executed.get("resolved_via") == "aria_combobox":
+                    script_params["resolved_via"] = "aria_combobox"
+                    script_params["trigger_selector"] = executed.get("trigger_selector")
+                    if executed.get("option_selector"):
+                        script_params["option_selector"] = executed["option_selector"]
                 await scripts.append_step(
                     test_case_id, method, script_params, step_desc, step_index,
                     status="passed", note="; ".join(_trace),

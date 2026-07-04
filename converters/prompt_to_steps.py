@@ -12,6 +12,7 @@ import uuid
 import httpx
 
 from helpers import coerce_llm_json
+from converters.json_input import normalize_case_type
 
 
 _OLLAMA_URL     = os.getenv("OLLAMA_URL",     "http://localhost:11434")
@@ -30,6 +31,7 @@ output a JSON test suite in the following format:
       "test_case_id": "<tc_id>",
       "test_case_name": "<name>",
       "test_suite_id": "<suite_id>",
+      "case_type": "<positive or negative>",
       "steps": [
         {"test_step_id": "1", "test_step_description": "<step>", "expected_result": "<expected>"},
         ...
@@ -43,6 +45,7 @@ Rules:
 - Each step must have a clear, actionable description.
 - Include at least one assertion step (VALID: <text> or assert_text).
 - Use realistic step descriptions for a web UI test (navigate, click, fill, etc.).
+- Set "case_type" to "negative" if the scenario tests invalid input, error handling, or an expected failure path; otherwise "positive".
 """
 
 # Matches "1. text", "2) text", "10. text" etc.
@@ -81,6 +84,7 @@ def _parse_numbered_list(text: str, suite_name: str = "") -> dict:
             "test_case_id":   f"{suite_id}_TC001",
             "test_case_name": name,
             "test_suite_id":  suite_id,
+            "case_type":      "positive",
             "steps":          steps,
         }],
         "draft": True,
@@ -112,9 +116,13 @@ async def _ollama_parse(text: str, suite_name: str = "") -> dict:
                 "test_case_id":   f"{suite_id}_TC001",
                 "test_case_name": "Generated Test Case",
                 "test_suite_id":  suite_id,
+                "case_type":      "positive",
                 "steps":          [{"test_step_id": "1", "test_step_description": text.strip(), "expected_result": ""}],
             }],
         }
+
+    for tc in suite.get("test_cases", []):
+        tc["case_type"] = normalize_case_type(tc.get("case_type"))
 
     suite["draft"] = True
     suite.setdefault("id", str(uuid.uuid4())[:8])

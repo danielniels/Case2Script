@@ -166,8 +166,18 @@ export default function SuitesList() {
           <div key={s.id} id={`suite-${s.id}`} className="bg-gray-800 rounded-lg p-4 flex items-center justify-between">
             <div>
               <p className="font-medium">{s.name}</p>
-              <p className="text-sm text-gray-400">
+              <p className="text-sm text-gray-400 flex items-center gap-2 flex-wrap">
                 {s.test_case_count} test case{s.test_case_count !== 1 ? 's' : ''} · {s.id}
+                {s.positive_count > 0 && (
+                  <span className="text-[10px] font-bold px-2 py-0.5 rounded-full bg-green-900/60 text-green-400">
+                    {s.positive_count} POSITIVE
+                  </span>
+                )}
+                {s.negative_count > 0 && (
+                  <span className="text-[10px] font-bold px-2 py-0.5 rounded-full bg-red-900/60 text-red-400">
+                    {s.negative_count} NEGATIVE
+                  </span>
+                )}
               </p>
               {s.description && <p className="text-xs text-gray-500 mt-1">{s.description}</p>}
             </div>

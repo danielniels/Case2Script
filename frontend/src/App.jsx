@@ -1,9 +1,11 @@
-import { createContext, useContext, useState } from 'react'
+import { createContext, useContext, useState, lazy, Suspense } from 'react'
 import { BrowserRouter, Routes, Route, NavLink } from 'react-router-dom'
 import RunPage from './pages/RunPage'
 import RunDetailPage from './pages/RunDetailPage'
 import HistoryPage from './pages/HistoryPage'
-import ScriptEditor from './pages/ScriptEditor'
+
+// Lazy-loaded: pulls in CodeMirror, which is large and only needed on this route
+const ScriptEditor = lazy(() => import('./pages/ScriptEditor'))
 
 export const RunContext = createContext({
   runId: null, setRunId: () => {},
@@ -94,7 +96,14 @@ function Layout() {
             <Route path="/" element={<RunPage />} />
             <Route path="/history" element={<HistoryPage />} />
             <Route path="/runs/:runId" element={<RunDetailPage />} />
-            <Route path="/scripts/:scriptPath" element={<ScriptEditor />} />
+            <Route
+              path="/scripts/:scriptPath"
+              element={
+                <Suspense fallback={<p className="p-6 text-gray-500 text-sm">Loading editor…</p>}>
+                  <ScriptEditor />
+                </Suspense>
+              }
+            />
           </Routes>
         </main>
       </div>

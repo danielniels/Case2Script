@@ -1,7 +1,7 @@
 """
 xlsx → TestSuite (draft, never auto-runs).
 Uses pandas to read the Excel. Expected columns:
-  test_suite_id, test_suite_name, test_case_id, test_case_name,
+  test_suite_id, test_suite_name, test_case_id, test_case_name, case_type,
   test_step_id, test_step_description, expected_result
 """
 
@@ -12,6 +12,7 @@ from typing import Optional
 import pandas as pd
 
 from helpers import clean_excel_formula
+from converters.json_input import normalize_case_type
 
 
 _REQUIRED_COLUMNS = {"test_step_description"}
@@ -24,6 +25,9 @@ _COLUMN_ALIASES = {
     "case": "test_case_id",
     "tc": "test_case_id",
     "suite": "test_suite_id",
+    "type": "case_type",
+    "tc_type": "case_type",
+    "kategori": "case_type",
 }
 
 
@@ -58,19 +62,23 @@ def excel_to_suite(file_bytes: bytes, filename: str = "upload.xlsx") -> dict:
         cases = []
         for tc_id, group in df.groupby("test_case_id", sort=False):
             tc_name = group["test_case_name"].iloc[0] if "test_case_name" in group.columns else tc_id
+            case_type = normalize_case_type(group["case_type"].iloc[0]) if "case_type" in group.columns else "positive"
             steps = _rows_to_steps(group)
             cases.append({
                 "test_case_id": tc_id,
                 "test_case_name": tc_name,
                 "test_suite_id": suite_id,
+                "case_type": case_type,
                 "steps": steps,
             })
     else:
         steps = _rows_to_steps(df)
+        case_type = normalize_case_type(df["case_type"].iloc[0]) if "case_type" in df.columns else "positive"
         cases = [{
             "test_case_id": suite_id,
             "test_case_name": suite_name,
             "test_suite_id": suite_id,
+            "case_type": case_type,
             "steps": steps,
         }]
 
@@ -101,7 +109,7 @@ def generate_excel_template() -> bytes:
     """Return a blank Excel template with the expected columns."""
     df = pd.DataFrame(columns=[
         "test_suite_id", "test_suite_name",
-        "test_case_id", "test_case_name",
+        "test_case_id", "test_case_name", "case_type",
         "test_step_id", "test_step_description", "expected_result",
     ])
     buf = BytesIO()

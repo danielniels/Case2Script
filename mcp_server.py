@@ -23,6 +23,7 @@ load_dotenv()
 import asyncio
 import json
 import os
+import re
 import sys
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -375,6 +376,15 @@ async def run_script(body: _ScriptRun):
     }
 
 
+_STEP_NUM_RE = re.compile(r"step_(\d+)")
+
+
+def _screenshot_sort_key(f: Path):
+    # step_N.png sorts numerically by N; anything else (e.g. FAILED.png) sorts after, alphabetically
+    m = _STEP_NUM_RE.search(f.name)
+    return (0, int(m.group(1))) if m else (1, f.name)
+
+
 @app.get("/api/scripts/screenshots")
 async def list_script_screenshots(screenshot_dir: str):
     try:
@@ -387,7 +397,7 @@ async def list_script_screenshots(screenshot_dir: str):
         raise HTTPException(status_code=403, detail="Directory not in allowed path")
     if not d.exists() or not d.is_dir():
         return {"screenshots": []}
-    pngs = sorted(d.glob("*.png"), key=lambda f: f.name)
+    pngs = sorted(d.glob("*.png"), key=_screenshot_sort_key)
     return {
         "screenshots": [
             {
