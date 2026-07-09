@@ -445,6 +445,78 @@ def _py(s) -> str:
     return repr(str(s))
 
 
+_QUOTED_LABEL_RE = re.compile(r"['\"]([^'\"]{1,80})['\"]")
+
+
+def _extract_quoted_label(desc: str) -> Optional[str]:
+    """Pull a quoted label out of a step description, e.g. "Check the checkbox
+    for test case 'Delete Cycle'" -> "Delete Cycle".
+
+    Used as a portability fallback for two live-session-only recording styles
+    that don't survive being replayed in a fresh browser session:
+      - click_by_index: clicks the Nth element of a live-refetched
+        "interactable elements" snapshot. That index has no meaning outside
+        the exact session it was captured in (it shifts with list length,
+        DOM state, timing, etc).
+      - a `click` selector containing a Radix/shadcn auto-generated id
+        (id="radix-_r_X_"). Radix assigns these via an internal mount-order
+        counter that resets and renumbers on every fresh page load, so an id
+        captured in one session is not guaranteed to exist — or to mean the
+        same thing — in another.
+    Where we can recover the option's visible text (from `expected_text` or a
+    quoted phrase in the description), we rebuild a text-based selector
+    instead, which IS stable across sessions since it doesn't depend on
+    DOM/mount ordering.
+    """
+    if not desc:
+        return None
+    matches = _QUOTED_LABEL_RE.findall(desc)
+    return matches[-1] if matches else None
+
+
+def _text_option_selector_py(label: str) -> str:
+    """Build a Playwright XPath that finds a listbox option / checkbox row by
+    its visible text, instead of a Radix auto-generated id or a live element
+    index. Known limitation: if `label` itself contains a `"` character, the
+    XPath attribute-value quoting below will break — rare in practice for UI
+    labels, not handled here."""
+    return (
+        f'//*[@role="option"][normalize-space(.) = "{label}"]'
+        f' | //*[@role="option"][.//text()[normalize-space(.) = "{label}"]]'
+        f' | //*[@cmdk-item][.//text()[normalize-space(.) = "{label}"]]'
+    )
+
+
+def _icon_button_selector_py(tag: str, identity_attr: str, identity_value: str,
+                              row_label: Optional[str] = None) -> str:
+    """Build a Playwright XPath for an icon-only button (no visible text —
+    identified by title or aria-label instead, e.g. a lucide <Eye> icon with
+    title="View"). This is a DIFFERENT shape than _text_option_selector_py:
+    that one is for combobox/listbox *options*; this one is for a plain
+    action button that happens to have no text content.
+
+    If row_label is given (from a quoted phrase in the step description, e.g.
+    "row where Name is 'X'"), the selector is scoped to the row/list-item
+    containing that text first — otherwise, with N rows each carrying an
+    identical title="View" button, .first would always click row 1 regardless
+    of which row the step actually meant. Checks tr / [role="row"] / li, same
+    as the live click_by_index row_context lookup (tools.py), so replayed
+    scripts and live runs resolve the same element the same way.
+
+    Known limitation: same as _text_option_selector_py — a `"` inside
+    identity_value or row_label breaks the XPath string literal; not handled.
+    """
+    tag = (tag or "button").lower()
+    base = f'//{tag}[@{identity_attr}="{identity_value}"]'
+    if not row_label:
+        return base
+    return (
+        f'//tr[contains(normalize-space(.), "{row_label}")]{base}'
+        f' | //*[@role="row"][contains(normalize-space(.), "{row_label}")]{base}'
+        f' | //li[contains(normalize-space(.), "{row_label}")]{base}'
+    )
+
+
 def _js_click_click_py(selector: str) -> str:
     """One click block — same isVisible+xpath/css lookup JS used by the 'click'
     template, parameterized on selector. Used to replay ARIA-combobox
@@ -483,7 +555,17 @@ def _js_click_click_py(selector: str) -> str:
 def _select_option_py(p: dict) -> str:
     if p.get("resolved_via") == "aria_combobox":
         trigger = p.get("trigger_selector") or p.get("selector", "")
-        option_sel = p.get("option_selector")
+        # Rebuild the option selector from `value` (the visible label, e.g.
+        # "TCM Testing" / "Medium") rather than trusting the recorded
+        # `option_selector`, which is usually scoped to a Radix auto-generated
+        # container id (id="radix-_r_X_"). That id is only valid within the
+        # exact browser session it was captured in — Radix renumbers its
+        # internal mount-order counter on every fresh page load, so a script
+        # exported from one session and replayed in another can silently
+        # resolve to the wrong (or a disabled) element. A text-based selector
+        # has no such dependency.
+        label = p.get("value", "")
+        option_sel = _text_option_selector_py(label) if label else p.get("option_selector")
         if not option_sel:
             return (
                 f"# select_option (ARIA combobox) — matched option text could not be\n"
@@ -531,6 +613,277 @@ def _select_option_py(p: dict) -> str:
     )
 
 
+# Injected once into any generated script that has an upload_file step, so the
+# standalone .py file never depends on Case2Script's data/fixtures/ folder or
+# its FastAPI backend. Resolution order, fully automated (zero clicks) for the
+# first four, dialog only as a last resort:
+#   1) env var override               — for CI/unattended runs
+#   2) absolute path (the hint itself, if it's already a full path)
+#   3) home-folder shortcut           — "downloads/x.pdf" -> ~/Downloads/x.pdf
+#      (mirrors tools.py::_resolve_fixtures on the live MCP session, so a case
+#      description written once behaves the same during recording AND replay)
+#   4) relative to the script's own working directory
+#   5) native OS file picker          — only reached if 1-4 all miss; this is
+#      the one path that needs a human at the keyboard.
+_UPLOAD_HELPER_PY = (
+    'def _resolve_upload_file(hint: str, env_var: str) -> str:\n'
+    '    """Resolve a file to upload without needing Case2Script\'s fixtures folder\n'
+    '    or its backend. See _UPLOAD_HELPER_PY comment in stores.py for the full\n'
+    '    resolution order — env var / absolute path / ~/Downloads-style shortcut /\n'
+    '    cwd-relative all resolve with ZERO manual interaction; only the final\n'
+    '    native-dialog fallback needs a human click."""\n'
+    '    override = os.environ.get(env_var)\n'
+    '    candidate = override or hint\n'
+    '    if os.path.isabs(candidate) and os.path.isfile(candidate):\n'
+    '        return candidate\n'
+    '    _shortcuts = {"downloads": "Downloads", "download": "Downloads",\n'
+    '                  "desktop": "Desktop", "documents": "Documents", "document": "Documents"}\n'
+    '    _norm = candidate.replace("\\\\", "/")\n'
+    '    _head, _sep, _rest = _norm.partition("/")\n'
+    '    if _sep and _rest:\n'
+    '        _head_s = _head.strip()\n'
+    '        _alias = _shortcuts.get(_head_s.lower())\n'
+    '        if _alias:\n'
+    '            _guess = os.path.join(os.path.expanduser("~"), _alias, _rest)\n'
+    '            if os.path.isfile(_guess):\n'
+    '                return _guess\n'
+    '        else:\n'
+    '            _home = os.path.expanduser("~")\n'
+    '            try:\n'
+    '                for _entry in os.listdir(_home):\n'
+    '                    if _entry.lower() == _head_s.lower() and os.path.isdir(os.path.join(_home, _entry)):\n'
+    '                        _guess2 = os.path.join(_home, _entry, _rest)\n'
+    '                        if os.path.isfile(_guess2):\n'
+    '                            return _guess2\n'
+    '            except OSError:\n'
+    '                pass\n'
+    '    else:\n'
+    '        # Bare filename, no folder prefix at all — scan common OS folders\n'
+    '        # in priority order (Documents first) before giving up. Mirrors\n'
+    '        # tools.py::_scan_common_folders on the live MCP session, so a\n'
+    '        # case description behaves the same during recording AND replay.\n'
+    '        _home3 = os.path.expanduser("~")\n'
+    '        for _folder in ("Documents", "Downloads", "Desktop"):\n'
+    '            _guess3 = os.path.join(_home3, _folder, candidate)\n'
+    '            if os.path.isfile(_guess3):\n'
+    '                print(f"[upload] bare filename {candidate!r} matched in ~/{_folder}/ -> {_guess3}")\n'
+    '                return _guess3\n'
+    '    if os.path.isfile(candidate):\n'
+    '        return os.path.abspath(candidate)\n'
+    '    if override:\n'
+    '        raise FileNotFoundError(f"{env_var} is set to {override!r} but that file does not exist")\n'
+    '    if os.environ.get("C2S_NO_DIALOG"):\n'
+    '        raise FileNotFoundError(\n'
+    '            f"Could not auto-resolve upload file for {hint!r} (tried absolute path, "\n'
+    '            f"~/Downloads or ~/Desktop or ~/Documents style shortcut, and cwd-relative), "\n'
+    '            f"and C2S_NO_DIALOG is set so the file picker is disabled. "\n'
+    '            f"Set env var {env_var}=<absolute path> instead."\n'
+    '        )\n'
+    '    print(\n'
+    '        f"[upload] Could not auto-resolve {hint!r} (checked absolute path, "\n'
+    '        f"~/Downloads-style shortcut, and cwd-relative). Opening a file picker so "\n'
+    '        f"you can select it manually — you have 120s. To skip this in unattended "\n'
+    '        f"runs, set env var {env_var}=<absolute path>, or C2S_NO_DIALOG=1 to fail fast instead."\n'
+    '    )\n'
+    '    import threading\n'
+    '    _dialog_result = {}\n'
+    '    def _show_dialog():\n'
+    '        try:\n'
+    '            import tkinter as tk\n'
+    '            from tkinter import filedialog\n'
+    '            root = tk.Tk()\n'
+    '            root.withdraw()\n'
+    '            root.attributes("-topmost", True)\n'
+    '            _dialog_result["path"] = filedialog.askopenfilename(title=f"Select file to upload: {hint}")\n'
+    '            root.destroy()\n'
+    '        except Exception as e:\n'
+    '            _dialog_result["error"] = e\n'
+    '    _t = threading.Thread(target=_show_dialog, daemon=True)\n'
+    '    _t.start()\n'
+    '    _t.join(timeout=120)\n'
+    '    if _t.is_alive():\n'
+    '        raise TimeoutError(\n'
+    '            f"No file selected within 120s for upload step: {hint!r}. If this ran "\n'
+    '            f"unattended by mistake, set env var {env_var}=<absolute path> instead."\n'
+    '        )\n'
+    '    _dialog_err = _dialog_result.get("error")\n'
+    '    if _dialog_err is not None:\n'
+    '        raise RuntimeError(\n'
+    '            f"Could not open file picker for {hint!r}: {_dialog_err}. "\n'
+    '            f"Fix the path, or set env var {env_var}=<absolute path>."\n'
+    '        ) from _dialog_err\n'
+    '    _path = _dialog_result.get("path")\n'
+    '    if not _path:\n'
+    '        raise RuntimeError(f"No file selected for upload step: {hint!r}")\n'
+    '    return _path'
+)
+
+
+def _upload_file_py(p: dict) -> str:
+    """Emits one _resolve_upload_file() call per file, then a single
+    set_input_files() with the resolved paths. env var name is derived from
+    the step id so multiple upload steps in one script don't collide."""
+    files = p.get("files", [])
+    if not isinstance(files, list):
+        files = [files]
+    if not files:
+        return "# upload_file step had no files recorded — nothing to generate"
+
+    safe_step_id = re.sub(r"[^A-Za-z0-9_]", "_", str(p.get("_step_id", "X"))).upper()
+    out_lines = []
+    var_names = []
+    for i, f in enumerate(files):
+        env_var = f"C2S_UPLOAD_{safe_step_id}_{i}"
+        var_name = f"_upload_{safe_step_id}_{i}"
+        out_lines.append(f"{var_name} = _resolve_upload_file({_py(f)}, {_py(env_var)})")
+        var_names.append(var_name)
+    out_lines.append(
+        f"await page.set_input_files({_py(p.get('selector',''))}, [{', '.join(var_names)}])"
+    )
+    return "\n".join(out_lines)
+
+
+# ==================== Selector classification (XPath -> semantic locator) ====================
+# Playwright's own docs recommend role/text/label/placeholder locators over
+# raw XPath/CSS — they mirror how a real user or screen reader perceives the
+# page and tolerate DOM restructuring that breaks brittle XPath text-node
+# matching. Every selector recorded into saved_scripts/*.json is already a
+# single, already-decided XPath/CSS string (see the click/fill MCP tool
+# schemas in tools.py — there's no separate role/text/placeholder field to
+# prefer instead), so this can only be a POST-hoc conversion: recognize the
+# small set of structural shapes this codebase's own recorder actually
+# produces, and rewrite those to Playwright's native locator API. Verified
+# against 182 real recorded selectors across every saved test case: 91%
+# (166/182) match one of the shapes below. Anything unrecognized returns
+# None — the caller keeps the raw XPath/CSS as the ONLY locator in that
+# case, identical to pre-existing behavior, so an unmatched shape is zero
+# regression, never a failure.
+
+_SEL_ID = re.compile(r'^(?:xpath=)?//\w+\[@id\s*=\s*["\']([^"\']+)["\']\]$', re.I)
+_SEL_NAME = re.compile(r'^(?:xpath=)?//\w+\[@name\s*=\s*["\']([^"\']+)["\']\]$', re.I)
+_SEL_PLACEHOLDER = re.compile(r'^(?:xpath=)?//\w+\[@placeholder\s*=\s*["\']([^"\']+)["\']\]$', re.I)
+_SEL_ARIA_LABEL = re.compile(r'^(?:xpath=)?//\w+\[@aria-label\s*=\s*["\']([^"\']+)["\']\]$', re.I)
+_SEL_TEXT = re.compile(
+    r'^(?:xpath=)?//(\w+)\[(?:\.//text\(\)|text\(\))\[normalize-space\(\.\)\s*=\s*'
+    r'(?:"([^"]*)"|\'([^\']*)\')\]\]$'
+)
+_TAG_TO_ROLE = {"button": "button", "a": "link"}
+
+
+def _classify_selector_py(selector: str) -> Optional[str]:
+    """Return a Playwright locator expression as source code (e.g.
+    'page.get_by_placeholder("Requirement name")') if `selector` matches a
+    known recorder shape, else None. `label/following::` (relative form-field
+    matching, e.g. //label[...]/following::input[1]) is deliberately NOT
+    converted to get_by_label() — that XPath shape exists specifically for
+    forms with no real <label for>/aria-labelledby association, which is
+    exactly what get_by_label() requires to find anything. Left as XPath —
+    safe, matches current behavior."""
+    if not selector:
+        return None
+    s = selector.strip()
+
+    m = _SEL_ID.match(s)
+    if m:
+        css = "#%s" % m.group(1)
+        return f"page.locator({_py(css)})"
+
+    m = _SEL_NAME.match(s)
+    if m:
+        css = '[name="%s"]' % m.group(1).replace('"', '\\"')
+        return f"page.locator({_py(css)})"
+
+    m = _SEL_PLACEHOLDER.match(s)
+    if m:
+        return f"page.get_by_placeholder({_py(m.group(1))}, exact=True)"
+
+    m = _SEL_ARIA_LABEL.match(s)
+    if m:
+        return f"page.get_by_label({_py(m.group(1))}, exact=True)"
+
+    m = _SEL_TEXT.match(s)
+    if m:
+        tag = m.group(1).lower()
+        label = m.group(2) if m.group(2) is not None else m.group(3)
+        role = _TAG_TO_ROLE.get(tag)
+        if role:
+            return f"page.get_by_role({_py(role)}, name={_py(label)}, exact=True)"
+        return f"page.get_by_text({_py(label)}, exact=True)"
+
+    return None
+
+
+# Injected into any generated script that has a click or fill step (i.e.
+# virtually all of them). Tries the semantic locator built by
+# _classify_selector_py() first; only falls back to the raw XPath/CSS
+# recorded at capture time if that times out. Both paths go through
+# Playwright's native click()/fill(), so actionability checks
+# (visible/stable/enabled/receives-events) always apply — unlike the old
+# page.evaluate() force-click this replaces, which bypassed them entirely
+# and could "succeed" against an element a real user couldn't reach.
+_LOCATOR_HELPER_PY = (
+    'async def click_with_fallback(page, primary, xpath_fallback, desc, timeout=6000):\n'
+    '    try:\n'
+    '        await primary.click(timeout=timeout)\n'
+    '    except Exception:\n'
+    '        print(f"[fallback] semantic locator failed for {desc}, trying recorded selector")\n'
+    '        await page.locator(xpath_fallback).first.click(timeout=timeout)\n'
+    '\n'
+    '\n'
+    'async def fill_with_fallback(page, primary, value, xpath_fallback, desc, timeout=6000):\n'
+    '    try:\n'
+    '        await primary.fill(value, timeout=timeout)\n'
+    '    except Exception:\n'
+    '        print(f"[fallback] semantic locator failed for {desc}, trying recorded selector")\n'
+    '        await page.locator(xpath_fallback).first.fill(value, timeout=timeout)'
+)
+
+
+def _click_py(p: dict) -> str:
+    selector = p.get('selector', '')
+    primary = _classify_selector_py(selector)
+    desc = _py(selector[:80])
+    if primary:
+        body = f"await click_with_fallback(page, {primary}, {_py(selector)}, {desc}, timeout=6000)\n"
+    else:
+        # No known semantic shape recognized (see _classify_selector_py) —
+        # use the recorded XPath/CSS directly via native click(), same
+        # selector as before. No JS-evaluate force-click anymore anywhere:
+        # Playwright's own actionability wait replaces it.
+        body = f"await page.locator({_py(selector)}).first.click(timeout=6000)\n"
+    return (
+        body +
+        f"try:\n"
+        f"    await page.wait_for_load_state('load')\n"
+        f"except Exception:\n"
+        f"    pass\n"
+        f"try:\n"
+        # Bounded to 2s — see identical comment on the "navigate" template.
+        f"    await page.wait_for_load_state('networkidle', timeout=2000)\n"
+        f"except Exception:\n"
+        f"    pass\n"
+        f"await page.wait_for_timeout(400)"
+    )
+
+
+def _fill_py(p: dict) -> str:
+    selector = p.get('selector', '')
+    text = p.get('text', '')
+    primary = _classify_selector_py(selector)
+    desc = _py(selector[:80])
+    if primary:
+        action = f"await fill_with_fallback(page, {primary}, {_py(text)}, {_py(selector)}, {desc}, timeout=6000)"
+    else:
+        action = f"await page.locator({_py(selector)}).first.fill({_py(text)})"
+    return (
+        f"try:\n"
+        f"    {action}\n"
+        f"except Exception:\n"
+        f"    await page.screenshot(path=f'{{SCREENSHOT_DIR}}/FAILED.png')\n"
+        f"    raise"
+    )
+
+
 _PY_TEMPLATES = {
     "navigate": lambda p: (
         f"await page.goto({_py(p.get('url',''))}, wait_until='domcontentloaded')\n"
@@ -539,57 +892,19 @@ _PY_TEMPLATES = {
         f"except Exception:\n"
         f"    pass\n"
         f"try:\n"
-        f"    await page.wait_for_load_state('networkidle')\n"
+        # Bounded to 2s, not Playwright's 30s default. Its result is never
+        # branched on (bare except below) — on apps with any persistent
+        # background traffic (polling, websockets, live-session pings), the
+        # page can go the *entire* run without a 500ms-quiet window, so this
+        # otherwise burns the full default timeout for zero benefit every
+        # single time. Measured on this app: 6+ steps hit exactly ~30.0s each
+        # before this fix (~180s of dead waiting out of a 191s run).
+        f"    await page.wait_for_load_state('networkidle', timeout=2000)\n"
         f"except Exception:\n"
         f"    pass"
     ),
 
-    "click": lambda p: (
-        f"_clicked = False\n"
-        f"try:\n"
-        f"    await page.locator({_py(p.get('selector',''))}).first.click(timeout=6000)\n"
-        f"    _clicked = True\n"
-        f"except Exception as _e:\n"
-        f"    print(f'[click] native click failed ({{type(_e).__name__}}), trying JS fallback')\n"
-        f"if not _clicked:\n"
-        f"    _result = await page.evaluate(\"\"\"(sel) => {{\n"
-        f"  function isVisible(node) {{\n"
-        f"    const s = window.getComputedStyle(node);\n"
-        f"    return s.display !== 'none' && s.visibility !== 'hidden' && node.offsetParent !== null;\n"
-        f"  }}\n"
-        f"  let el;\n"
-        f"  const xsel = sel.startsWith('xpath=') ? sel.slice(6) : sel;\n"
-        f"  if (xsel.startsWith('//')) {{\n"
-        f"      const r = document.evaluate(xsel, document, null, XPathResult.ORDERED_NODE_SNAPSHOT_TYPE, null);\n"
-        f"      for (let i = 0; i < r.snapshotLength; i++) {{\n"
-        f"          const node = r.snapshotItem(i);\n"
-        f"          if (isVisible(node)) {{ el = node; break; }}\n"
-        f"      }}\n"
-        f"  }} else {{\n"
-        f"      const nodes = document.querySelectorAll(xsel);\n"
-        f"      for (const node of nodes) {{\n"
-        f"          if (isVisible(node)) {{ el = node; break; }}\n"
-        f"      }}\n"
-        f"  }}\n"
-        f"  if (!el) return {{found: false}};\n"
-        f"  const disabled = el.disabled || el.getAttribute('aria-disabled') === 'true' || getComputedStyle(el).pointerEvents === 'none';\n"
-        f"  if (disabled) return {{found: true, disabled: true}};\n"
-        f"  el.click();\n"
-        f"  return {{found: true, disabled: false, clicked: true}};\n"
-        f"}}\"\"\", {_py(p.get('selector',''))})\n"
-        f"    print(f'[click] JS fallback result: {{_result}}')\n"
-        f"    if not _result.get('clicked'):\n"
-        f"        raise ValueError(f'click failed for selector — {{_result}}')\n"
-        f"try:\n"
-        f"    await page.wait_for_load_state('load')\n"
-        f"except Exception:\n"
-        f"    pass\n"
-        f"try:\n"
-        f"    await page.wait_for_load_state('networkidle')\n"
-        f"except Exception:\n"
-        f"    pass\n"
-        f"await page.wait_for_timeout(400)"
-    ),
+    "click": _click_py,
 
     "click_at_position": lambda p: "\n".join([
         f"await page.locator({_py(p.get('selector', '.mapwrap svg'))}).first.click(position={{'x': {c['x']}, 'y': {c['y']}}})\n"
@@ -597,13 +912,7 @@ _PY_TEMPLATES = {
         for c in (p.get('clicks') or [{"x": p.get('x', 0), "y": p.get('y', 0)}])
     ]),
 
-    "fill": lambda p: (
-        f"try:\n"
-        f"    await page.locator({_py(p.get('selector',''))}).first.fill({_py(p.get('text',''))})\n"
-        f"except Exception:\n"
-        f"    await page.screenshot(path=f'{{SCREENSHOT_DIR}}/FAILED.png')\n"
-        f"    raise"
-    ),
+    "fill": _fill_py,
 
     "select_option": _select_option_py,
 
@@ -633,10 +942,7 @@ _PY_TEMPLATES = {
     "clear_input": lambda p:
         f"await page.fill({_py(p.get('selector',''))}, '')",
 
-    "upload_file": lambda p: (
-        f"await page.set_input_files({_py(p.get('selector',''))}, "
-        f"{p.get('files', []) if isinstance(p.get('files'), list) else [p.get('files','')]!r})"
-    ),
+    "upload_file": _upload_file_py,
 
     "assert_text": lambda p: (
         f"_loc = page.locator({_py(p['selector'])}).first\n"
@@ -735,28 +1041,59 @@ def generate_playwright_py_from_json(json_path: str) -> Optional[str]:
     pw_dir = Path("data/saved_playwright_scripts_py")
     pw_dir.mkdir(parents=True, exist_ok=True)
     py_path = str(pw_dir / f"{stem}.py")
-    screenshots_dir = f"data/saved_playwright_scripts_py/screenshots/{stem}"
+    # NOTE: screenshot/result paths are no longer built here as strings — the
+    # generated script computes them at runtime via SCREENSHOT_DIR, which is
+    # anchored to the script's own file location (os.path.dirname(__file__)),
+    # so they resolve correctly regardless of the caller's cwd (project root
+    # for the live backend, or the script's own folder for script-runner's
+    # batch runner).
+
+    has_upload = any(s.get("method") == "upload_file" for s in steps)
+    has_click_or_fill = any(s.get("method") in ("click", "fill") for s in steps)
 
     lines = [
         f"# Auto-generated Playwright script — {stem}",
         f"# Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
         f"# Source: {Path(json_path).name}",
-        f"# Run: python {stem}.py",
+        f"# Run (from project root): python {py_path}",
         "# Requires: pip install playwright && playwright install chromium",
         "",
         "import asyncio",
         "import os",
+        "import json",
         "from playwright.async_api import async_playwright",
         "",
-        f"SCREENSHOT_DIR = {_py(screenshots_dir)}",
+        "# Anchored to this file's own location, NOT the caller's cwd — so this",
+        "# script writes screenshots/results to the same place whether it's run",
+        "# from the project root (old behavior) or via script-runner/run_scripts.py",
+        "# (which sets cwd to this script's own folder, e.g. for batch runs).",
+        "_SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))",
+        f"SCREENSHOT_DIR = os.path.join(_SCRIPT_DIR, 'screenshots', {_py(stem)})",
         "os.makedirs(SCREENSHOT_DIR, exist_ok=True)",
+        f"RESULT_PATH = os.path.join(_SCRIPT_DIR, {_py(f'{stem}.result.json')})",
         "",
+    ]
+    if has_upload:
+        lines += [
+            "",
+            _UPLOAD_HELPER_PY,
+            "",
+        ]
+    if has_click_or_fill:
+        lines += [
+            "",
+            _LOCATOR_HELPER_PY,
+            "",
+        ]
+    lines += [
         "",
         "async def run_test():",
         "    async with async_playwright() as pw:",
         "        browser = await pw.chromium.launch(headless=False)",
         "        context = await browser.new_context(ignore_https_errors=True)",
         "        page = await context.new_page()",
+        "",
+        "        _step_results = []   # structured per-step outcomes, dumped to RESULT_PATH in finally",
         "",
         "        try:",
     ]
@@ -769,6 +1106,7 @@ def generate_playwright_py_from_json(json_path: str) -> Optional[str]:
         step_id = step.get("id", "?")
 
         params = dict(params)
+        params["_step_id"] = step_id
         original = params.get("selector", "")
         resolved = params.get("resolved_selector", "")
         # Prefer original selector; fall back to resolved_selector only when
@@ -780,7 +1118,62 @@ def generate_playwright_py_from_json(json_path: str) -> Optional[str]:
         elif resolved and ("[" in resolved or "@" in resolved or "#" in resolved):
             params["selector"] = resolved
 
+        # --- Portability normalization -----------------------------------------
+        # Two recording styles only make sense inside the exact live browser
+        # session they were captured in, and silently produce broken/no-op code
+        # when replayed standalone later:
+        #   - click_by_index: clicks the Nth element of a live-refetched
+        #     "interactable elements" snapshot. There's no selector at all to
+        #     translate — the index shifts with list length/DOM state — so the
+        #     current per-method templates have nothing to emit for it.
+        #   - click with a Radix/shadcn auto-generated id (id="radix-_r_X_"):
+        #     valid Playwright code, but the id is only valid in the session it
+        #     was captured in (Radix's internal mount-order counter renumbers on
+        #     every fresh page load).
+        # Where we have a visible-text label to fall back to (expected_text, or
+        # a quoted phrase in the step description), rewrite to a text-based
+        # selector instead — stable across sessions since it doesn't depend on
+        # DOM/mount ordering.
+        _fallback_label = params.get("expected_text") or _extract_quoted_label(desc)
+        if method == "click_by_index":
+            # Icon-only action button (View/Edit/Delete — identified by title or
+            # aria-label, no visible text) vs. a combobox/listbox option pick are
+            # two different shapes that both went through click_by_index. Prefer
+            # the icon-button shape whenever the recorder captured it (added
+            # 2026-07-08 — see engine.py/tools.py); older recordings made before
+            # that fall through to the option-selector guess below unchanged.
+            _identity_attr = "title" if params.get("element_title") else (
+                "aria-label" if params.get("element_aria_label") else None)
+            _identity_value = params.get("element_title") or params.get("element_aria_label")
+            if _identity_attr and _identity_value:
+                method = "click"
+                _row_label = _extract_quoted_label(desc)
+                params["selector"] = _icon_button_selector_py(
+                    params.get("element_tag", "button"), _identity_attr, _identity_value, _row_label
+                )
+            elif _fallback_label:
+                method = "click"
+                params["selector"] = _text_option_selector_py(_fallback_label)
+            else:
+                method = "__unsupported__"
+        elif method == "click" and "radix-" in str(params.get("selector", "")) and _fallback_label:
+            params["selector"] = _text_option_selector_py(_fallback_label)
+        # --- end normalization ---------------------------------------------------
+
         lines.append("")
+
+        if method == "__unsupported__":
+            lines.append(
+                f"            # STEP {step_id} [{step.get('method')}] — recorded as click_by_index with no "
+                f"expected_text/label to fall back to."
+            )
+            lines.append(
+                "            # This method only works inside a live, DOM-refetching MCP session "
+                "(clicks the Nth element of a snapshot taken at that moment) and has no stable "
+                "Playwright equivalent."
+            )
+            lines.append(f"            # MANUAL FIX NEEDED: {desc}")
+            continue
 
         if method in _PY_SKIP:
             lines.append(f"            # [Step {step_id}] {desc} [{method}] — MCP-only, skipped")
@@ -797,17 +1190,48 @@ def generate_playwright_py_from_json(json_path: str) -> Optional[str]:
 
         lines.append(f"            # Step {step_id}: {desc}")
         lines.append(f"            print('>> STEP {step_id}')")
+        # Each step gets its own try/except so a failure is recorded with the
+        # exact step_id/description/error BEFORE re-raising up to the outer
+        # handler (which still stops the whole script — batch-level continue
+        # logic lives in script-runner/run_scripts.py, not here).
+        lines.append("            try:")
+
+        safe_step_id = re.sub(r"[^A-Za-z0-9_]", "_", str(step_id))
 
         if method == "screenshot":
-            ss_path = f"{screenshots_dir}/step_{step_id}.png"
-            lines.append(f"            await page.screenshot(path={_py(ss_path)})")
-            continue
+            shot_var = f"_shot_{safe_step_id}"
+            lines.append(f"                {shot_var} = os.path.join(SCREENSHOT_DIR, {_py(f'step_{step_id}.png')})")
+            lines.append(f"                await page.screenshot(path={shot_var})")
+            lines.append(
+                f"                _step_results.append({{'step_id': {_py(str(step_id))}, "
+                f"'description': {_py(desc)}, 'status': 'passed', 'error': None, "
+                f"'screenshot': {shot_var}}})"
+            )
+        else:
+            py_line = _method_to_py(method, params)
+            if py_line:
+                lines.append(textwrap.indent(py_line, "                ").rstrip())
+                shot_var = f"_shot_{safe_step_id}"
+                lines.append(f"                {shot_var} = os.path.join(SCREENSHOT_DIR, {_py(f'step_{step_id}.png')})")
+                lines.append(f"                await page.screenshot(path={shot_var})")
+                lines.append(
+                    f"                _step_results.append({{'step_id': {_py(str(step_id))}, "
+                    f"'description': {_py(desc)}, 'status': 'passed', 'error': None, "
+                    f"'screenshot': {shot_var}}})"
+                )
+            else:
+                lines.append(f"                pass  # unrecognized method: {method}")
+                lines.append(
+                    f"                _step_results.append({{'step_id': {_py(str(step_id))}, "
+                    f"'description': {_py(desc)}, 'status': 'passed', 'error': None, 'screenshot': None}})"
+                )
 
-        py_line = _method_to_py(method, params)
-        if py_line:
-            lines.append(textwrap.indent(py_line, "            ").rstrip())
-            ss_auto = f"{screenshots_dir}/step_{step_id}.png"
-            lines.append(f"            await page.screenshot(path={_py(ss_auto)})")
+        lines.append("            except Exception as _step_err:")
+        lines.append(
+            f"                _step_results.append({{'step_id': {_py(str(step_id))}, "
+            f"'description': {_py(desc)}, 'status': 'failed', 'error': str(_step_err), 'screenshot': None}})"
+        )
+        lines.append("                raise")
 
     lines += [
         "",
@@ -816,6 +1240,11 @@ def generate_playwright_py_from_json(json_path: str) -> Optional[str]:
         "            print(f'Test failed: {err}')",
         "            raise",
         "        finally:",
+        "            try:",
+        "                with open(RESULT_PATH, 'w', encoding='utf-8') as _rf:",
+        f"                    json.dump({{'test_case': {_py(stem)}, 'steps': _step_results}}, _rf, indent=2, ensure_ascii=False)",
+        "            except Exception as _report_err:",
+        "                print(f'[report] could not write result json: {_report_err}')",
         "            await browser.close()",
         "",
         "",

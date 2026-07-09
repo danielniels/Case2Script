@@ -565,7 +565,7 @@ export default function RunPage() {
             </a>
             <p className="text-xs text-gray-600">
               Required column: <span className="font-mono text-gray-500">test_step_description</span>.
-              Optional: <span className="font-mono text-gray-500">test_suite_id, test_case_id, test_case_name, test_step_id, expected_result</span>
+              Optional: <span className="font-mono text-gray-500">test_suite_id, test_case_id, test_case_name, case_type, test_step_id, expected_result</span>
             </p>
           </div>
         )}

@@ -37,18 +37,120 @@ from stores import Session
 
 FIXTURES_DIR = Path("data/fixtures")
 
+# Lets a case description say "downloads/invoice.pdf" instead of a full
+# absolute path or a pre-staged fixtures file. Resolves against the CURRENT
+# QA's own home directory at execution time — since the MCP server runs
+# locally per-QA (not a shared/remote server), "downloads/x.pdf" on QA-A's
+# machine and QA-B's machine correctly point at each of their own files, no
+# manual copy-to-fixtures step needed. This is what makes upload steps like
+# "Upload Dokumen → downloads/invoice.pdf" fully automatable — set_input_files
+# is called directly with the resolved path, zero dialog, zero manual click.
+_HOME_SHORTCUTS = {
+    "downloads": "Downloads",
+    "download": "Downloads",
+    "desktop": "Desktop",
+    "documents": "Documents",
+    "document": "Documents",
+}
+
+
+def _resolve_home_shortcut(f: str) -> Optional[Path]:
+    """"<folder>/<rest>" -> Path.home()/<real folder>/<rest>.
+    _HOME_SHORTCUTS is only an ALIAS table (translates common words like
+    "download" to the real Windows folder name "Downloads") — it is not a
+    whitelist. Any first path segment that's a real, existing directory
+    under the home folder is accepted too, so this isn't limited to 5
+    hardcoded names (Pictures, Music, OneDrive, "Gambar", whatever the OS
+    actually has) as long as the folder genuinely exists."""
+    normalized = f.replace("\\", "/")
+    head, sep, rest = normalized.partition("/")
+    if not sep or not rest:
+        return None
+    head = head.strip()
+
+    folder_name = _HOME_SHORTCUTS.get(head.lower())
+    if folder_name:
+        home_folder = Path.home() / folder_name
+        if home_folder.is_dir():
+            return home_folder / rest
+
+    # Not a known alias — case-insensitively scan the home dir's immediate
+    # children for a real folder matching what the user typed (Pictures,
+    # OneDrive, "Gambar", whatever actually exists). Explicit case-insensitive
+    # compare instead of relying on the OS's own case sensitivity, since that
+    # varies (Windows/macOS: insensitive by default, Linux: sensitive).
+    try:
+        for entry in Path.home().iterdir():
+            if entry.is_dir() and entry.name.lower() == head.lower():
+                return entry / rest
+    except OSError:
+        pass
+    return None
+
+
+# Priority order for scanning common OS folders when the case description
+# gives a BARE filename with no folder prefix at all (e.g. "invoice.pdf",
+# not "downloads/invoice.pdf"). Documents first, per project preference —
+# change this order here if that priority should differ.
+_BARE_FILENAME_SCAN_ORDER = ["Documents", "Downloads", "Desktop"]
+
+
+def _scan_common_folders(filename: str) -> Optional[Path]:
+    """Bare filename, no explicit folder — check common folders in priority
+    order before giving up to fixtures. Top-level only (not recursive), so
+    this stays fast and predictable rather than an open-ended filesystem
+    crawl. Prints which folder matched so a hit is never a silent surprise."""
+    for folder in _BARE_FILENAME_SCAN_ORDER:
+        candidate = Path.home() / folder / filename
+        if candidate.is_file():
+            print(f"[upload] bare filename {filename!r} matched in ~/{folder}/ -> {candidate}")
+            return candidate
+    return None
+
 
 def _resolve_fixtures(files: list[str]) -> list[str]:
-    """Relative paths resolve into data/fixtures/. Absolute paths pass through.
-    Raises FileNotFoundError with a clear message if the file is missing —
-    so portability breaks loudly, not as an opaque Playwright timeout."""
+    """Resolution order for each file path/hint:
+    1. Absolute path — passes through as-is.
+    2. Home-folder shortcut ("downloads/x.pdf", "desktop/x.pdf", "documents/x.pdf")
+       — resolves against THIS machine's home directory.
+    3. Bare filename with NO folder prefix ("invoice.pdf") — scans
+       Documents -> Downloads -> Desktop (top-level only) before giving up.
+       Does NOT apply when an explicit folder prefix was given but didn't
+       resolve (e.g. "gambar/x.jpg" where "gambar" doesn't exist) — that
+       case goes straight to fixtures rather than guessing a different folder.
+    4. Falls back to data/fixtures/<name> (legacy pre-staged fixture files).
+    Raises FileNotFoundError with a clear message if nothing matches — so
+    portability breaks loudly, not as an opaque Playwright timeout."""
     resolved = []
     for f in files:
         p = Path(f)
+        tried = [str(p)] if p.is_absolute() else []
         if not p.is_absolute():
-            p = FIXTURES_DIR / f
+            has_folder_prefix = "/" in f.replace("\\", "/")
+            shortcut = _resolve_home_shortcut(f)
+            if shortcut:
+                tried.append(str(shortcut))
+
+            if shortcut and shortcut.exists():
+                p = shortcut
+            elif not has_folder_prefix:
+                scanned = _scan_common_folders(f)
+                if scanned:
+                    tried.append(str(scanned))
+                    p = scanned
+                else:
+                    p = FIXTURES_DIR / f
+                    tried.append(str(p))
+            else:
+                p = FIXTURES_DIR / f
+                tried.append(str(p))
         if not p.exists():
-            raise FileNotFoundError(f"upload file not found: {p} (cwd={Path.cwd()})")
+            raise FileNotFoundError(
+                f"upload file not found for hint {f!r} (cwd={Path.cwd()}). "
+                f"Tried, in order: {tried}. None of these paths exist on this machine — "
+                f"either the file isn't actually there yet, or (if you just edited tools.py) "
+                f"the MCP server process is still running the OLD code and needs a restart."
+            )
         resolved.append(str(p.resolve()))
     return resolved
 
@@ -352,12 +454,29 @@ async def cmd_select_option(params: dict, session: Session):
             aria_result = await _aria_combobox_pick(session.page, sel, value)
             handled = aria_result["success"]
         if not handled:
-            is_select = await session.page.evaluate("""
+            # Resolve directly to an ElementHandle (instead of a boolean +
+            # re-resolving `sel` again via page.select_option) so the exact
+            # node we validate as a real <select> is the exact node we act
+            # on. Also scope to the topmost open modal dialog, if any:
+            # without this, a <select> matching `sel` in the background
+            # (e.g. a page-level filter dropdown) can be silently picked
+            # instead of the real in-modal control, reporting SUCCESS while
+            # the visible field never changes.
+            select_handle = await session.page.evaluate_handle("""
                 (sel) => {
                     try {
                         function isVisible(node) {
                             const s = window.getComputedStyle(node);
                             return s.display !== 'none' && s.visibility !== 'hidden' && node.offsetParent !== null;
+                        }
+                        let modalRoot = null;
+                        for (const d of document.querySelectorAll('[role="dialog"][aria-modal="true"]')) {
+                            if (isVisible(d)) { modalRoot = d; break; }
+                        }
+                        function consider(node) {
+                            if (!isVisible(node)) return false;
+                            if (modalRoot && !modalRoot.contains(node)) return false;
+                            return true;
                         }
                         let el = null;
                         if (sel.startsWith('//') || sel.startsWith('xpath=')) {
@@ -365,25 +484,28 @@ async def cmd_select_option(params: dict, session: Session):
                             const r = document.evaluate(xsel, document, null, XPathResult.ORDERED_NODE_SNAPSHOT_TYPE, null);
                             for (let i = 0; i < r.snapshotLength; i++) {
                                 const node = r.snapshotItem(i);
-                                if (isVisible(node)) { el = node; break; }
+                                if (consider(node)) { el = node; break; }
                             }
                         } else {
                             const nodes = document.querySelectorAll(sel);
                             for (const node of nodes) {
-                                if (isVisible(node)) { el = node; break; }
+                                if (consider(node)) { el = node; break; }
                             }
                         }
-                        return el?.tagName === 'SELECT';
-                    } catch(e) { return false; }
+                        return (el && el.tagName === 'SELECT') ? el : null;
+                    } catch(e) { return null; }
                 }
             """, sel)
-            if is_select:
+            select_el = select_handle.as_element()
+            if select_el:
                 try:
-                    await session.page.select_option(sel, label=value)
+                    await select_el.select_option(label=value)
                 except Exception:
-                    await session.page.select_option(sel, value=value)
+                    await select_el.select_option(value=value)
+                await select_handle.dispose()
             else:
-                raise Exception(f"select_option failed: could not find Select2, ARIA combobox, or native <select> for value='{value}'")
+                await select_handle.dispose()
+                raise Exception(f"select_option failed: could not find Select2, ARIA combobox, or native <select> for value='{value}' (checked inside the active modal dialog when one is open)")
         await asyncio.sleep(0.5)
 
     result = {"selector": sel, "value": value}
@@ -892,6 +1014,7 @@ async def cmd_get_interactable_elements(params: dict, session: Session):
                 elements = await frame.query_selector_all(
                     "button, a, input, textarea, select, "
                     "[role='button'], [role='link'], [role='combobox'], [role='listbox'], "
+                    "[role='option'], [role='checkbox'], "
                     "span[role='combobox'], span[role='button'], span[tabindex], "
                     "[data-act], [data-link]"
                 )
@@ -918,8 +1041,18 @@ async def cmd_get_interactable_elements(params: dict, session: Session):
                     aria_label = await el.get_attribute("aria-label")
                     placeholder = await el.get_attribute("placeholder")
                     data_act = await el.get_attribute("data-act")
+                    role_attr = await el.get_attribute("role")
+                    title_attr = await el.get_attribute("title")
 
-                    if tag_name not in ("INPUT", "TEXTAREA", "SELECT") and not (get_id or get_name or text_content or get_href or aria_label or placeholder):
+                    # Icon-only buttons (SVG child, no text/aria-label/id/name) are a
+                    # near-universal pattern — not TCM-specific. Most icon buttons
+                    # across the web rely on the native `title` tooltip attribute
+                    # instead of aria-label for their accessible hint. Without reading
+                    # it, these elements had zero identifying signal, got dropped from
+                    # the candidate list entirely, and forced the matcher to guess at
+                    # an unrelated element instead (e.g. picking a navbar button that
+                    # coincidentally shared one word with the step description).
+                    if tag_name not in ("INPUT", "TEXTAREA", "SELECT") and not (get_id or get_name or text_content or get_href or aria_label or placeholder or title_attr):
                         continue
 
                     direct_text = await el.evaluate(
@@ -929,18 +1062,53 @@ async def cmd_get_interactable_elements(params: dict, session: Session):
                         ".filter(Boolean).join(' ')"
                     )
 
+                    # combobox/listbox triggers (Radix/shadcn Select buttons) show
+                    # their CURRENTLY SELECTED VALUE as their text (e.g. "Low") —
+                    # not a stable field identifier. A selector built on that text
+                    # breaks the moment the value differs from whatever it was
+                    # when the selector was generated. Prefer the adjacent <label>
+                    # instead, same idea as the INPUT/SELECT label fallback further
+                    # down, but checked here so it outranks the value-text branch.
+                    combobox_label_text = ""
+                    if role_attr in ("combobox", "listbox") and not (get_id or get_name or aria_label):
+                        combobox_label_text = (await el.evaluate("""e => {
+                            if (e.id) {
+                                const lbl = document.querySelector('label[for="' + e.id + '"]');
+                                if (lbl) return lbl.textContent.trim();
+                            }
+                            let node = e.parentElement;
+                            while (node && node !== document.body) {
+                                const lbl = node.querySelector('label');
+                                if (lbl) return lbl.textContent.trim();
+                                node = node.parentElement;
+                            }
+                            return '';
+                        }""") or "").strip()
+
                     if get_id:
                         _suggested = f'xpath=//{tag_name.lower()}[@id="{get_id}"]'
                     elif get_name:
                         _suggested = f'xpath=//{tag_name.lower()}[@name="{get_name}"]'
                     elif aria_label:
                         _suggested = f'xpath=//{tag_name.lower()}[@aria-label="{aria_label}"]'
+                    elif title_attr:
+                        _suggested = f'xpath=//{tag_name.lower()}[@title="{title_attr}"]'
                     elif placeholder:
                         _suggested = f'xpath=//{tag_name.lower()}[@placeholder="{placeholder}"]'
+                    elif combobox_label_text:
+                        _suggested = f'xpath=//label[normalize-space(.)="{combobox_label_text}"]/following::*[@role="{role_attr}"][1]'
                     elif direct_text or text_content:
                         source_text = direct_text or text_content
-                        first_line = source_text.split('\n')[0].strip()
-                        _suggested = f'xpath=//{tag_name.lower()}[.//text()[normalize-space(.) = "{first_line}"]]' if first_line else ""
+                        child_text_count = await el.evaluate("""
+                            e => e.tagName === 'SELECT'
+                                ? e.options.length
+                                : Array.from(e.children).filter(c => (c.textContent||'').trim()).length
+                        """)
+                        if child_text_count > 1:
+                            _suggested = ""
+                        else:
+                            first_line = source_text.split('\n')[0].strip()
+                            _suggested = f'xpath=//{tag_name.lower()}[.//text()[normalize-space(.) = "{first_line}"]]' if first_line else ""
                     elif data_act and tag_name not in ("BUTTON", "A", "INPUT", "SELECT", "TEXTAREA"):
                         _suggested = f'xpath=//{tag_name.lower()}[@data-act="{data_act}" and .//*[normalize-space(.) = "{text_content.split(chr(10))[0].strip()}"]]'
                     elif text_content:
@@ -954,7 +1122,7 @@ async def cmd_get_interactable_elements(params: dict, session: Session):
 
                     # For inputs with no usable selector, find the nearest label text
                     # and build a label-based XPath (handles Vue/OrangeHRM style forms)
-                    label_text = ""
+                    label_text = combobox_label_text
                     if not _suggested and tag_name in ("INPUT", "TEXTAREA", "SELECT"):
                         label_text = (await el.evaluate("""e => {
                             if (e.id) {
@@ -972,17 +1140,32 @@ async def cmd_get_interactable_elements(params: dict, session: Session):
                         if label_text:
                             _suggested = f'//label[normalize-space(.)="{label_text}"]/following::input[1]'
 
+                    # title/aria-label solve WHAT an icon-only element is (View vs
+                    # Delete). They don't solve WHICH instance it is when a table/list
+                    # renders the same icon once per row — "row where Name is 'X'" steps
+                    # need to disambiguate by row content, not just icon identity.
+                    # Walk up to the nearest row-like ancestor (table row, ARIA row, or
+                    # list item — not table-specific) and capture its text so the
+                    # matcher can confirm "this element's row contains X" in addition
+                    # to "this element is a View icon".
+                    row_context = (await el.evaluate("""e => {
+                        const row = e.closest('tr, [role="row"], li');
+                        return row ? row.textContent.replace(/\\s+/g, ' ').trim().slice(0, 200) : '';
+                    }""") or "").strip()
+
                     result.append({
                         "id": get_id, "tag": tag_name, "type": input_type, "value": input_value,
                         "text": text_content, "disabled": await el.evaluate("e => !!e.disabled"),
                         "name": get_name, "href": get_href,
-                        "role": await el.get_attribute("role"),
+                        "role": role_attr,
                         "aria_controls": await el.get_attribute("aria-controls"),
                         "tabindex": tabindex, "aria_hidden": aria_hidden,
                         "aria_label": aria_label, "placeholder": placeholder,
+                        "title": title_attr,
                         "data_act": data_act, "visible": True,
                         "in_iframe": frame != session.page.main_frame,
                         "label": label_text,
+                        "row_context": row_context,
                         "suggested_selector": _suggested,
                     })
                 except Exception:
@@ -1004,11 +1187,37 @@ async def cmd_click_by_index(params: dict, session: Session):
     target = elements[index]
     actual_text = (target.get("text") or "").strip()
 
-    if expected_text and actual_text != expected_text:
+    # Drift check must accept whatever field the LLM was told to copy from —
+    # not just "text". Icon-only buttons (no text, identified by title or
+    # aria-label instead) legitimately have expected_text pulled from those
+    # fields. Comparing only against "text" made every title/aria-label-only
+    # element fail drift detection forever, regardless of site. Compare
+    # against any of the identifying fields; if ANY matches, it's the same
+    # element and there's no real drift.
+    actual_aria_label = (target.get("aria_label") or "").strip()
+    actual_title = (target.get("title") or "").strip()
+
+    # Substring match, not exact-equality: the LLM is instructed to copy ONLY
+    # the identity value, but in practice sometimes wraps it in extra text
+    # (e.g. "BUTTON title=\"View\" row=\"...\"" instead of plain "View"). If the
+    # real identity value still appears inside whatever the model produced,
+    # that's the same element — reject only when NONE of the identifying
+    # fields show up at all, which is the actual signature of real DOM drift
+    # (a different element with an unrelated identity at this index).
+    def _contains_match(expected: str, *actual_values: str) -> bool:
+        exp = expected.strip().lower()
+        for val in actual_values:
+            val = (val or "").strip().lower()
+            if val and (val in exp or exp in val):
+                return True
+        return False
+
+    if expected_text and not _contains_match(expected_text, actual_text, actual_aria_label, actual_title):
         return {
             "error": f"click_by_index drift: expected_text={expected_text!r}, "
-                     f"actual_text={actual_text!r} at index={index} — DOM order "
-                     f"shifted between prompt build and execution, refusing to click"
+                     f"actual text/aria-label/title={(actual_text, actual_aria_label, actual_title)!r} "
+                     f"at index={index} — DOM order shifted between prompt build and "
+                     f"execution, refusing to click"
         }
 
     # NEW: index was structurally valid, now check it's actually relevant to the step
@@ -1032,8 +1241,16 @@ async def cmd_click_by_index(params: dict, session: Session):
         return {"error": f"Element at index {index} has no usable selector", "element": target}
     async with session.lock:
         await session.page.click(selector)
+    # element_title/element_aria_label/element_row_context are surfaced so the
+    # caller (engine.py) can persist them into the recorded script step. Without
+    # this, the saved JSON only has {index, expected_text} — enough to replay
+    # live (re-scores against a fresh snapshot) but not enough for the static
+    # Playwright .py generator to build a real selector, since "index" has no
+    # meaning outside a live session. See stores.py click_by_index normalization.
     return {"status": "clicked", "index": index, "selector": selector,
             "element_text": actual_text, "element_tag": target.get("tag", ""),
+            "element_aria_label": actual_aria_label, "element_title": actual_title,
+            "element_row_context": (target.get("row_context") or "").strip(),
             "relevance_score": score if step_description else None}
 
 

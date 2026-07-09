@@ -512,7 +512,13 @@ def _find_upload_selector(elements: list, label_hint: str) -> Optional[str]:
     """Find the upload target from live page elements.
 
     Priority tiers (stops at first hit):
-      pass 1   : real file input — wins regardless of hint
+      pass 1a  : exactly one real file input on the page — wins unconditionally,
+                 hint is irrelevant since there's no ambiguity to resolve
+      pass 1b  : multiple real file inputs (e.g. KTP + NPWP + Foto in one form)
+                 — hint MUST match one of them (checked against that input's own
+                 id/name/aria_label/placeholder/label/text). No match → returns
+                 None rather than silently grabbing whichever is first in DOM
+                 order, which would upload to the wrong field.
       pass 2a-i: upload-word AND hint both match (most specific — disambiguates multi-upload pages)
       pass 2a-ii: upload-word only (no hint, or hint absent from blob)
       pass 2b  : hint only, no upload-word — lowest confidence
@@ -521,14 +527,33 @@ def _find_upload_selector(elements: list, label_hint: str) -> Optional[str]:
     hint = (label_hint or "").lower()
     _UPLOAD_WORDS = {"upload", "unggah", "browse", "choose file", "pilih file", "select file", "attach", "lampiran"}
 
-    # pass 1: real file input wins unconditionally
-    for el in elements:
-        if (el.get("tag") or "").upper() == "INPUT" and (el.get("type") or "").lower() == "file":
-            if el.get("suggested_selector"):
-                return el["suggested_selector"]
-            if el.get("id"):
-                return f'//INPUT[@id="{el["id"]}"]'
-            return '//INPUT[@type="file"]'
+    def _selector_for(el: dict) -> str:
+        if el.get("suggested_selector"):
+            return el["suggested_selector"]
+        if el.get("id"):
+            return f'//INPUT[@id="{el["id"]}"]'
+        return '//INPUT[@type="file"]'
+
+    file_inputs = [
+        el for el in elements
+        if (el.get("tag") or "").upper() == "INPUT" and (el.get("type") or "").lower() == "file"
+    ]
+
+    if len(file_inputs) == 1:
+        return _selector_for(file_inputs[0])
+
+    if len(file_inputs) > 1:
+        if hint:
+            for el in file_inputs:
+                blob = " ".join(
+                    str(el.get(k, "")) for k in ("id", "name", "aria_label", "placeholder", "label", "text")
+                ).lower()
+                if hint in blob:
+                    return _selector_for(el)
+        # Multiple real inputs, no confident hint match — don't guess which
+        # one is right. Caller falls back to LLM, which can use broader
+        # page context (surrounding text, layout) to disambiguate.
+        return None
 
     # pass 2a-i: upload-word AND hint both present — most specific match
     if hint:

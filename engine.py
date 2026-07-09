@@ -267,6 +267,8 @@ async def execute_step(body: dict, request: Request) -> dict:
         status = "passed"
         failure_reason = None
 
+        params.setdefault("step_description", step_desc)
+
         try:
             executed = await dispatch(method, params, session, request)
 
@@ -311,6 +313,16 @@ async def execute_step(body: dict, request: Request) -> dict:
                     script_params["trigger_selector"] = executed.get("trigger_selector")
                     if executed.get("option_selector"):
                         script_params["option_selector"] = executed["option_selector"]
+                if method == "click_by_index" and isinstance(executed, dict):
+                    # click_by_index only has an "index" at recording time, which is
+                    # meaningless in a fresh replay session (DOM order isn't stable
+                    # across runs). Persist the matched element's real identity
+                    # (tag/title/aria-label/row context) so the static Playwright .py
+                    # generator (stores.py) can build an actual selector instead of
+                    # guessing or leaving the step unsupported.
+                    for _k in ("element_tag", "element_title", "element_aria_label", "element_row_context"):
+                        if executed.get(_k):
+                            script_params[_k] = executed[_k]
                 await scripts.append_step(
                     test_case_id, method, script_params, step_desc, step_index,
                     status="passed", note="; ".join(_trace),
