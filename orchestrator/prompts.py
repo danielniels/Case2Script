@@ -3,6 +3,11 @@ System prompt + per-step prompt builder.
 Ported verbatim from n8n nodes:
   - "System Prompt" (Set node, field system_prompt)
   - "build prompt" (Code node)
+
+The TOOLS section of the system prompt is the one part NOT verbatim/static
+anymore — it's generated at request time from tool_registry.TOOL_REGISTRY
+(see _get_system_prompt below) so it can never drift out of sync with
+tools.CMD_MAP the way the old hand-typed copy could.
 """
 
 import json
@@ -10,9 +15,11 @@ import re
 from typing import Optional
 
 # ---------------------------------------------------------------------------
-# SYSTEM_PROMPT — verbatim from n8n node "System Prompt", field system_prompt
+# SYSTEM_PROMPT — head/tail are verbatim from n8n node "System Prompt", field
+# system_prompt; the TOOLS section between them is generated, see
+# _get_system_prompt().
 # ---------------------------------------------------------------------------
-SYSTEM_PROMPT = """You are an automation JSON generator for a Playwright MCP server.
+_SYSTEM_PROMPT_HEAD = """You are an automation JSON generator for a Playwright MCP server.
 Output ONLY valid JSON. No explanation, no markdown, no comments.
 
 Output format:
@@ -23,42 +30,41 @@ Output format:
 
 ================================
 TOOLS
-================================
+================================"""
 
-navigate          | params: sessionId, url
-click             | params: sessionId, selector (XPath)
-fill              | params: sessionId, selector (XPath), text
-select_option     | params: sessionId, selector (XPath), value (option label text)
-hover             | params: sessionId, selector (XPath)
-double_click      | params: sessionId, selector (XPath)
-scroll_to_element | params: sessionId, selector (XPath)
-clear_input       | params: sessionId, selector (XPath)
-press_key         | params: sessionId, key ("Escape" | "Enter" | "Tab" | "ArrowDown" | "ArrowUp" | "Backspace")
-upload_file       | params: sessionId, selector (XPath targeting <input type="file">), files (path string — absolute path, OR a home-folder shortcut like "downloads/invoice.pdf" / "desktop/x.png" / "documents/y.docx" resolved against the current machine's home directory, exactly as written in the step description — do not invent an absolute path yourself)
-switch_tab        | params: sessionId, index (int, 0-based) OR url_contains (string)
-click_by_index    | params: sessionId, index (int, from elements list), expected_text (string, exact text shown at [index] in AVAILABLE ELEMENTS — required for drift detection)
+_system_prompt_cache: Optional[str] = None
 
-screenshot           | params: sessionId only
-assert_text          | params: sessionId, selector (XPath), expected (text substring) — for div/span/p/td/li; also works on input/textarea (reads value if no inner text)
-assert_visible       | params: sessionId, selector (XPath)
-assert_not_visible   | params: sessionId, selector (XPath)
-assert_disabled      | params: sessionId, selector (XPath)
-assert_url           | params: sessionId, expected (URL substring)
-assert_toast         | params: sessionId, expected_text (substring), timeout (ms, default 6000) — waits for a toast/popup/snackbar/SweetAlert to appear and validates its text
-get_page_info        | params: sessionId only
-get_page_content     | params: sessionId only
 
-get_text                      | params: sessionId, selector (XPath)
-get_all_text                  | params: sessionId, selector (XPath)
-get_attribute                 | params: sessionId, selector (XPath), attribute (e.g. "href")
-get_page_content_and_save_csv | params: sessionId only
-get_page_content_and_save_txt | params: sessionId only
+def _get_system_prompt() -> str:
+    """Lazily build SYSTEM_PROMPT: head (static) + TOOLS table (generated from
+    tool_registry.TOOL_REGISTRY, single source of truth shared with
+    tools.CMD_MAP) + tail (static — decision guide / xpath rules / test data
+    / constraints, unchanged).
 
-wait_for_load     | params: sessionId, state ("load" | "networkidle" | "domcontentloaded"), timeout (ms)
-wait_for_selector | params: sessionId, selector (XPath), state ("visible" | "hidden"), timeout (ms)
-close_session     | params: sessionId only
-get_credentials   | params: sessionId, name (credential name string)
+    Must stay lazy, not a module-level constant: tools.py does
+    `from orchestrator.prompts import _relevance_score` near the top of its
+    file, BEFORE any of its @register_tool decorators run further down — if
+    this module built the prompt at import time, TOOL_REGISTRY would still be
+    empty and the TOOLS section would render blank. By the time
+    build_step_prompt() is actually called at request time, tools.py has
+    finished importing and every tool is registered, so building once here
+    (cached) is both correct and cheap.
+    """
+    global _system_prompt_cache
+    if _system_prompt_cache is None:
+        from tool_registry import render_tools_table
+        _system_prompt_cache = (
+            # _SYSTEM_PROMPT_TAIL already starts with its own leading "\n"
+            # (left over from the original file's blank line before the
+            # DECISION GUIDE divider) — so only one more "\n" is needed here
+            # to reproduce the original single blank line between the TOOLS
+            # table and that divider, not two.
+            _SYSTEM_PROMPT_HEAD + "\n\n" + render_tools_table() + "\n" + _SYSTEM_PROMPT_TAIL
+        )
+    return _system_prompt_cache
 
+
+_SYSTEM_PROMPT_TAIL = """
 ================================
 DECISION GUIDE
 ================================
@@ -87,6 +93,21 @@ Step mentions: "tampil", "muncul di halaman", "valid:", "verify", "validate", "p
     get_text. Return exactly: {"method": "no_match", "params": {}} — a step
     that correctly reports "I don't know what value to check" is better than
     one that silently reads an unrelated element and reports false success.
+  → IMPORTANT exception to the "must appear in AVAILABLE ELEMENTS" rule
+    (that rule is about click/click_by_index picking a REAL element to
+    interact with — it does not apply here): assert_text's target is very
+    often plain non-interactive text (a stat, counter, status label) that
+    NEVER appears in AVAILABLE ELEMENTS at all, since that list only tracks
+    interactive elements (buttons/links/inputs/etc). Do NOT return no_match
+    just because the expected value isn't visible in AVAILABLE ELEMENTS — as
+    long as the step has a concrete expected value, emit assert_text with
+    your best-effort selector (a specific container if you can identify one,
+    otherwise selector: "//body" is an acceptable default). assert_text
+    itself now does a full-page visible-text search as a fallback if your
+    selector guess doesn't directly contain the expected text, so it does not
+    need to be exact. Reserve no_match for when there is genuinely no
+    concrete expected value to check, not for "I don't see it in the element
+    list."
 
 Step mentions: "tutup popup", "close modal", "press esc", "tekan esc", "dismiss"
   → press_key, key: "Escape"
@@ -221,7 +242,7 @@ _INPUT_WORDS = frozenset({
 _QUOTED_LABEL_RE = re.compile(r"['\"]([^'\"]{1,80})['\"]")
 
 
-def _relevance_score(step_description: str, el: dict) -> int:
+def _relevance_score(step_description: str, el: dict, last_combobox_controls: str = None) -> int:
     step_tokens = set(re.split(r'[^a-zA-Z0-9]+', step_description.lower()))
     step_tokens.discard('')
 
@@ -231,6 +252,25 @@ def _relevance_score(step_description: str, el: dict) -> int:
         el_tokens = set(re.split(r'[^a-zA-Z0-9]+', val.lower()))
         el_tokens.discard('')
         score += len(step_tokens & el_tokens)
+
+    # Token-set overlap misses compound-word vs multi-word mismatches — e.g.
+    # step says "login" (one word) but the button's actual label is "Log In"
+    # (tokenizes to {"log", "in"}), so neither token equals "login" and
+    # overlap is 0 even though it's obviously the right element. Found via a
+    # real TC_003 regression: "Click the login button" scored 0 against the
+    # "Log In" button once the click-verb bonus below was gated on score > 0,
+    # so a step that always worked got refused. Catch this by also comparing
+    # flattened (spaces/punctuation stripped) forms: if the element's own
+    # text/aria-label/title, flattened, appears as a contiguous substring of
+    # the flattened step description, that's a strong signal on its own —
+    # length-gated at 4 chars so short fields like "ok"/"id" don't trigger
+    # coincidental matches.
+    step_flat = re.sub(r'[^a-z0-9]', '', step_description.lower())
+    for field in ('text', 'aria_label', 'title'):
+        val_flat = re.sub(r'[^a-z0-9]', '', (el.get(field) or '').lower())
+        if len(val_flat) >= 4 and val_flat in step_flat:
+            score += 2
+            break
 
     # title/aria-label tell you WHAT an icon is (View vs Delete) but not WHICH
     # row it belongs to — a table with one "View" icon per row has N identical
@@ -245,6 +285,24 @@ def _relevance_score(step_description: str, el: dict) -> int:
             if label.lower() in row_context:
                 score += 5
                 break
+
+    # Widget-instance disambiguation: a page can host several independent
+    # Select/combobox widgets (e.g. a component-library docs page stacking
+    # multiple demos). An option's text alone can coincidentally match a value
+    # already displayed by a DIFFERENT, closed widget elsewhere on the page —
+    # e.g. one demo's trigger already shows "Banana" as its committed value
+    # while we're actually trying to pick "Banana" from a DIFFERENT, currently
+    # OPEN listbox. last_combobox_controls is the aria-controls id of the
+    # trigger most recently clicked open in THIS session — an option whose
+    # owning_popup_id matches it is confirmed to be in the popup we actually
+    # just opened; an option belonging to a different popup is very likely the
+    # wrong instance, even though its bare text matched.
+    if last_combobox_controls and el.get('role') == 'option':
+        owning = el.get('owning_popup_id') or ''
+        if owning and owning == last_combobox_controls:
+            score += 5
+        elif owning and owning != last_combobox_controls:
+            score -= 10
 
     step_words = set(step_description.lower().split())
     tag = (el.get('tag') or '').upper()
@@ -334,8 +392,9 @@ def build_step_prompt(
     el_lines = [_format_element(orig_i, el) for orig_i, el in top]
     el_str = "\n".join(el_lines)
 
+    system_prompt = _get_system_prompt()
     sections = [
-        SYSTEM_PROMPT,
+        system_prompt,
         f"SESSION ID: {session_id}",
         f"AVAILABLE ELEMENTS ({len(elements)} total, showing {len(top)}):\n{el_str}",
     ]
@@ -347,7 +406,7 @@ def build_step_prompt(
 
     # DEBUG — mirrors n8n console.log in "build prompt" node
     print("=== PROMPT DEBUG ===")
-    print(f"system_prompt chars: {len(SYSTEM_PROMPT)}")
+    print(f"system_prompt chars: {len(system_prompt)}")
     print(f"elements str chars: {len(el_str)}")
     print(f"total prompt chars: {len(prompt)}")
     print("====================")

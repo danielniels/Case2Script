@@ -19,6 +19,8 @@ class RunState:
         self.session_id = session_id
         self.total_steps = total_steps
         self.status = "running"      # running | passed | failed | stopped
+        self.pass_count = 0
+        self.fail_count = 0
         self.current_step = 0
         self.events: List[dict] = []
         self._queue: asyncio.Queue = asyncio.Queue()
@@ -109,6 +111,8 @@ def _run_summary(r: RunState) -> dict:
         "test_case_id": r.test_case_id,
         "test_case_name": r.test_case_name,
         "status": r.status,
+        "pass_count": r.pass_count,
+        "fail_count": r.fail_count,
         "current_step": r.current_step,
         "total_steps": r.total_steps,
         "started_at": r.started_at,

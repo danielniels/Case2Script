@@ -418,6 +418,18 @@ async def _force_action(page: Page, selector: str, action: str, text: str = ""):
         const target = findElement(document);
         if (!target) return false;
 
+        // Playwright's native Locator actions (click/fill/etc.) auto-scroll
+        // the target into view before acting — that's built into its
+        // actionability checks. This JS-injection path bypasses Playwright's
+        // action pipeline entirely (raw DOM manipulation via page.evaluate),
+        // so it gets none of that for free. Without this, the visible
+        // browser sits static while fills/clicks happen off-screen — same
+        // effect either way, just nothing to watch. block:'center' matches
+        // what Playwright itself targets.
+        try {
+            target.scrollIntoView({ block: 'center', inline: 'nearest', behavior: 'instant' });
+        } catch (e) {}
+
         if (action === 'click') {
             if (target.tagName === 'OPTION') {
                 const select = target.closest('select');
@@ -470,13 +482,25 @@ async def _force_action(page: Page, selector: str, action: str, text: str = ""):
         } else if (action === 'fill') {
             const desc = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value')
                       || Object.getOwnPropertyDescriptor(window.HTMLTextAreaElement.prototype, 'value');
+            // Full focus -> input -> keyup -> change -> blur sequence.
+            // Some frameworks (Angular reactive forms in particular) gate
+            // form/button validity on 'blur' or 'keyup', not just 'input'/
+            // 'change'. Setting .value + dispatching only input/change can
+            // leave the DOM looking filled while the framework's internal
+            // form-validity state (and anything bound to it, e.g. a
+            // disabled submit button) never updates.
+            target.dispatchEvent(new Event('focus', { bubbles: true }));
+            target.focus();
             if (desc && desc.set) {
                 desc.set.call(target, text);
             } else {
                 target.value = text;
             }
             target.dispatchEvent(new Event('input',  { bubbles: true }));
+            target.dispatchEvent(new KeyboardEvent('keyup', { bubbles: true }));
             target.dispatchEvent(new Event('change', { bubbles: true }));
+            target.dispatchEvent(new Event('blur',   { bubbles: true }));
+            target.blur();
             return { ok: true, resolved: buildStableSelector(target) };
         } else if (action === 'double_click') {
             const init = (detail) => ({ bubbles: true, cancelable: true, view: window, detail });

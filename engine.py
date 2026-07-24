@@ -320,7 +320,7 @@ async def execute_step(body: dict, request: Request) -> dict:
                     # (tag/title/aria-label/row context) so the static Playwright .py
                     # generator (stores.py) can build an actual selector instead of
                     # guessing or leaving the step unsupported.
-                    for _k in ("element_tag", "element_title", "element_aria_label", "element_row_context"):
+                    for _k in ("element_tag", "element_title", "element_aria_label", "element_row_context", "element_text"):
                         if executed.get(_k):
                             script_params[_k] = executed[_k]
                 await scripts.append_step(

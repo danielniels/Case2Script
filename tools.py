@@ -1,6 +1,11 @@
 """
-All cmd_* command handlers + register_tool decorator + CMD_MAP.
-Depends on: helpers.py, stores.py, credentials.py
+All cmd_* command handlers + CMD_MAP.
+Depends on: helpers.py, stores.py, credentials.py, tool_registry.py
+
+register_tool/TOOL_REGISTRY live in tool_registry.py, not here — see that
+file's module docstring for why (tools.py imports orchestrator.prompts,
+which needs to import the registry back to build its TOOLS section; keeping
+the registry in tools.py would make that circular).
 """
 
 import asyncio
@@ -31,6 +36,7 @@ from helpers import (
     screenshot_to_base64,
 )
 from stores import Session
+from tool_registry import TOOL_REGISTRY, register_tool, verify_registry_matches
 
 
 # ==================== Upload fixtures helpers ====================
@@ -182,26 +188,6 @@ async def _verify_uploaded_filename(page, basenames: list[str], timeout: int = 5
 
 
 # ==================== Tool Registry ====================
-
-TOOL_REGISTRY: Dict[str, Dict[str, Any]] = {}
-
-
-def register_tool(name: str, description: str, input_schema: Optional[Dict] = None):
-    """Declarative tool metadata for MCP compliance. Additive — does NOT change execution."""
-    def decorator(func: Callable):
-        TOOL_REGISTRY[name] = {
-            "name": name,
-            "description": description,
-            "inputSchema": input_schema or {
-                "type": "object",
-                "properties": {},
-                "required": []
-            },
-            "handler": func,
-        }
-        return func
-    return decorator
-
 
 # ==================== Toast Capture JS ====================
 
@@ -442,7 +428,9 @@ async def _aria_combobox_pick(page, sel: str, value: str) -> dict:
             "text": {"type": "string"},
         },
         "required": ["selector"]
-    }
+    },
+    category="action",
+    llm_doc='selector (XPath), value (option label text)',
 )
 async def cmd_select_option(params: dict, session: Session):
     sel = normalize_selector(params["selector"])
@@ -526,7 +514,9 @@ async def cmd_select_option(params: dict, session: Session):
             "url": {"type": "string"}
         },
         "required": ["url"]
-    }
+    },
+    category="action",
+    llm_doc="url",
 )
 async def cmd_navigate(params: dict, session: Session):
     async with session.lock:
@@ -558,7 +548,12 @@ async def cmd_navigate(params: dict, session: Session):
             "fail_on_error": {"type": "boolean"},
         },
         "required": ["selector"]
-    }
+    },
+    category="action",
+    # Only `selector` is documented to the LLM — the rest (capture_toast,
+    # toast_selector, etc.) are engine-internal knobs set by engine.py's
+    # toast-capture logic, not something the LLM is ever asked to fill in.
+    llm_doc="selector (XPath)",
 )
 async def cmd_click(params: dict, session: Session):
     sel = normalize_selector(params["selector"])
@@ -672,6 +667,14 @@ async def cmd_click(params: dict, session: Session):
 
         loc = await _find_locator(session.page, sel)
         try:
+            # Playwright's own auto-scroll (inside .click()) only moves the
+            # minimum distance needed — element often ends up flush against
+            # the viewport edge, sometimes under a sticky header. Force a
+            # centered scroll first so it lands with breathing room.
+            await loc.evaluate("el => el.scrollIntoView({block: 'center', inline: 'nearest', behavior: 'instant'})")
+        except Exception:
+            pass
+        try:
             await loc.click(timeout=8000)
             success = True
             resolved = None
@@ -688,6 +691,24 @@ async def cmd_click(params: dict, session: Session):
                     f"Element not found or not clickable: {sel!r}. "
                     "Use get_interactable_elements to verify the selector."
                 )
+
+        # Same popup-tracking as cmd_click_by_index (see there for full
+        # rationale): if what we just clicked has aria-controls, remember it
+        # as the currently-open popup so a following click_by_index step
+        # ("pick option X from the list") can be scored against it. This
+        # needed to live here TOO, not just in click_by_index — the LLM
+        # doesn't consistently route trigger-opens through click_by_index; a
+        # trigger with a stable id gets a plain `click` instead (reasonably,
+        # per DECISION GUIDE's own id-selector preference), and that path was
+        # silently not updating last_combobox_controls at all. Found via a
+        # live shadcn "Banana" run where step 2 used `click` (id-based
+        # selector) instead of click_by_index — 2026-07-09.
+        try:
+            _controls = await loc.get_attribute("aria-controls")
+            if _controls:
+                session.last_combobox_controls = _controls
+        except Exception:
+            pass
 
         if capture_toast:
             print(f"[TOAST TIMING] click returned at t={time.monotonic()-_t0:.2f}s")
@@ -814,7 +835,10 @@ async def cmd_click(params: dict, session: Session):
             "clicks": {"type": "array", "items": {"type": "object"}},
         },
         "required": ["selector"]
-    }
+    },
+    # Not in the LLM's TOOLS menu — a low-level coordinate-click helper the
+    # LLM never picks directly (it uses click / click_by_index instead).
+    visible_to_llm=False,
 )
 async def cmd_click_at_position(params: dict, session: Session):
     sel = params.get("selector", ".mapwrap svg")
@@ -839,7 +863,9 @@ async def cmd_click_at_position(params: dict, session: Session):
             "text": {"type": "string"},
         },
         "required": ["selector", "text"]
-    }
+    },
+    category="action",
+    llm_doc="selector (XPath), text",
 )
 async def cmd_fill(params: dict, session: Session):
     sel = normalize_selector(params["selector"])
@@ -855,29 +881,50 @@ async def cmd_fill(params: dict, session: Session):
         except Exception:
             pass
 
-        result = await _force_action(session.page, sel, "fill", text)
-        success = bool(result)
-        resolved = result.get("resolved") if isinstance(result, dict) else None
-
-        if success:
-            await asyncio.sleep(0.5)
-        else:
-            loc = await _find_locator(session.page, sel)
-            try:
-                await loc.wait_for(state="visible", timeout=30000)
-                await loc.fill(text)
-            except Exception as e:
+        # Native Playwright fill first — matches cmd_click/cmd_double_click.
+        # Native .fill() carries Playwright's actionability checks (visible/
+        # stable/enabled) AND a real focus->input->change->blur sequence that
+        # JS-framework form validation (Angular/React) actually listens for.
+        # _force_action's raw DOM-value-set + dispatchEvent can leave a form
+        # LOOKING filled while the framework's own validity state never
+        # updates — e.g. a submit button gated on form.invalid staying
+        # disabled forever with no visible error. See 2026-07-23 register
+        # button investigation.
+        loc = await _find_locator(session.page, sel)
+        try:
+            # See cmd_click: force a centered scroll before acting so the
+            # field doesn't land flush against the viewport edge.
+            await loc.evaluate("el => el.scrollIntoView({block: 'center', inline: 'nearest', behavior: 'instant'})")
+        except Exception:
+            pass
+        try:
+            await loc.wait_for(state="visible", timeout=8000)
+            await loc.fill(text, timeout=8000)
+            success = True
+        except (PlaywrightTimeoutError, PlaywrightError):
+            # Native actionability check failed — fall back to JS force-fill.
+            # Known limitation: _force_action's isVisible() does not check disabled
+            # state or pointer-events, so a disabled-but-rendered element can
+            # false-pass here. That is a pre-existing issue, out of scope for this change.
+            result = await _force_action(session.page, sel, "fill", text)
+            success = bool(result)
+            resolved = result.get("resolved") if isinstance(result, dict) else None
+            if not success:
                 raise ValueError(
-                    f"Element not found or not interactable after 30s: {sel!r}. "
+                    f"Element not found or not interactable: {sel!r}. "
                     "Use get_interactable_elements to verify the selector."
-                ) from e
+                )
+
+        await asyncio.sleep(0.5)
     return {"selector": sel, "text": text, "resolved_selector": resolved}
 
 
 @register_tool(
     "hover",
     "Hover the mouse over an element to trigger hover states, tooltips, or dropdown menus.",
-    {"type": "object", "properties": {"selector": {"type": "string"}}, "required": ["selector"]}
+    {"type": "object", "properties": {"selector": {"type": "string"}}, "required": ["selector"]},
+    category="action",
+    llm_doc="selector (XPath)",
 )
 async def cmd_hover(params: dict, session: Session):
     sel = normalize_selector(params["selector"])
@@ -890,7 +937,9 @@ async def cmd_hover(params: dict, session: Session):
 @register_tool(
     "get_text",
     "Get the text content of a single element. Tries DOM injection first, falls back to Playwright.",
-    {"type": "object", "properties": {"selector": {"type": "string"}}, "required": ["selector"]}
+    {"type": "object", "properties": {"selector": {"type": "string"}}, "required": ["selector"]},
+    category="extract",
+    llm_doc="selector (XPath)",
 )
 async def cmd_get_text(params: dict, session: Session):
     sel = normalize_selector(params["selector"])
@@ -905,7 +954,9 @@ async def cmd_get_text(params: dict, session: Session):
 @register_tool(
     "get_all_text",
     "Get the text content of ALL elements matching a selector.",
-    {"type": "object", "properties": {"selector": {"type": "string"}}, "required": ["selector"]}
+    {"type": "object", "properties": {"selector": {"type": "string"}}, "required": ["selector"]},
+    category="extract",
+    llm_doc="selector (XPath)",
 )
 async def cmd_get_all_text(params: dict, session: Session):
     sel = normalize_selector(params["selector"])
@@ -927,7 +978,13 @@ async def cmd_get_all_text(params: dict, session: Session):
             "return_base64": {"type": "boolean"},
         },
         "required": []
-    }
+    },
+    category="verify",
+    # path/full_page/return_base64 are internal defaults, not LLM-set params —
+    # llm_doc="" (not None) explicitly suppresses auto-derivation from the
+    # schema's properties, which would otherwise list them as if the LLM
+    # should fill them in.
+    llm_doc="",
 )
 async def cmd_screenshot(params: dict, session: Session):
     default_path = f"data/saved_screenshots/MCP_screenshots/screenshot_{datetime.now().strftime('%d%m%Y_%H%M%S')}.png"
@@ -947,7 +1004,8 @@ async def cmd_screenshot(params: dict, session: Session):
 @register_tool(
     "get_page_content",
     "Return the full raw HTML source of the current page.",
-    {"type": "object", "properties": {}, "required": []}
+    {"type": "object", "properties": {}, "required": []},
+    category="verify",
 )
 async def cmd_get_page_content(params: dict, session: Session):
     async with session.lock:
@@ -958,7 +1016,8 @@ async def cmd_get_page_content(params: dict, session: Session):
 @register_tool(
     "get_page_info",
     "Return the current page title and URL.",
-    {"type": "object", "properties": {}, "required": []}
+    {"type": "object", "properties": {}, "required": []},
+    category="verify",
 )
 async def cmd_get_page_info(params: dict, session: Session):
     async with session.lock:
@@ -970,7 +1029,11 @@ async def cmd_get_page_info(params: dict, session: Session):
     "No element on the page matches this step's description. The LLM "
     "declined to guess an element rather than risk clicking the wrong one. "
     "This always resolves as a tracked failure, not a silent skip.",
-    {"type": "object", "properties": {}, "required": []}
+    {"type": "object", "properties": {}, "required": []},
+    # Not listed in the TOOLS table — the LLM is told to emit this via the
+    # DECISION GUIDE prose ("Return exactly: {"method": "no_match", ...}"),
+    # not by picking it off a menu, so it stays out of render_tools_table().
+    visible_to_llm=False,
 )
 async def cmd_no_match(params: dict, session: Session):
     return {"error": "No element found matching this step's description — LLM declined to guess."}
@@ -983,7 +1046,11 @@ async def cmd_no_match(params: dict, session: Session):
         "type": "object",
         "properties": {"sessionId": {"type": "string"}},
         "required": ["sessionId"]
-    }
+    },
+    category="wait_session",
+    # schema's own "sessionId" property is the same sessionId every tool
+    # already gets prefixed with — llm_doc="" avoids rendering it twice.
+    llm_doc="",
 )
 async def cmd_close_session(params: dict, session: Session, request: Request):
     session_id = params["sessionId"]
@@ -991,10 +1058,201 @@ async def cmd_close_session(params: dict, session: Session, request: Request):
     return {"status": "closed"}
 
 
+# Batched, single-round-trip element scraper. The previous implementation did
+# ~18-22 separate `await el.get_attribute(...)`/`el.evaluate(...)` Playwright
+# round trips PER element (visibility, aria-hidden, tabindex, tag, text, id,
+# name, href, aria-label, placeholder, data-act, role, title, direct-text,
+# combobox-label, child-count, input type/value, label lookup, row context,
+# aria-controls, disabled). On an element-dense page (e.g. a docs site with a
+# 100+ link sidebar) that's 1800-2000+ round trips just to scrape one snapshot
+# — the actual cause of multi-second "why is this so slow after navigate"
+# delays. This does the exact same extraction logic in ONE page.evaluate() per
+# frame instead: one browser-side pass over the DOM, one round trip back.
+# Every field name/priority-order below is a direct port of the old Python
+# logic — same suggested_selector fallback chain, same row_context lookup,
+# same combobox-label-vs-value-text handling. Behavior should be identical,
+# just without the network fan-out.
+_INTERACTABLE_ELEMENTS_JS = """
+() => {
+    function isVisible(el) {
+        // Mirrors Playwright's own actionability "visible" definition exactly:
+        // non-empty bounding box (width AND height both > 0) and no
+        // visibility:hidden. Deliberately does NOT check opacity — Playwright's
+        // real is_visible() doesn't either; an opacity:0 element (common for
+        // fade-in animations, hover-reveal buttons) is still "visible" and
+        // clickable per Playwright's own model. An earlier version of this
+        // function added an opacity check and used AND instead of OR for the
+        // width/height test — both were unintentional deviations from the
+        // Playwright semantics the old per-element el.is_visible() scraper
+        // actually had, found during a regression audit against TC_003 (a
+        // previously-passing 9/9 test case) on 2026-07-09. Match Playwright's
+        // behavior exactly here, don't invent stricter/looser rules.
+        if (!el.isConnected) return false;
+        const style = window.getComputedStyle(el);
+        if (style.display === 'none' || style.visibility === 'hidden') return false;
+        const rect = el.getBoundingClientRect();
+        if (rect.width === 0 || rect.height === 0) return false;
+        return true;
+    }
+
+    function findLabel(node) {
+        if (node.id) {
+            const lbl = document.querySelector('label[for="' + node.id + '"]');
+            if (lbl) return lbl.textContent.trim();
+        }
+        let p = node.parentElement;
+        while (p && p !== document.body) {
+            const lbl = p.querySelector('label');
+            if (lbl) return lbl.textContent.trim();
+            p = p.parentElement;
+        }
+        return '';
+    }
+
+    const nodes = Array.from(document.querySelectorAll(
+        "button, a, input, textarea, select, " +
+        "[role='button'], [role='link'], [role='combobox'], [role='listbox'], " +
+        "[role='option'], [role='checkbox'], " +
+        "span[role='combobox'], span[role='button'], span[tabindex], " +
+        "[data-act], [data-link]"
+    ));
+
+    const result = [];
+
+    for (const e of nodes) {
+        try {
+            if (!isVisible(e)) continue;
+
+            const ariaHidden = e.getAttribute('aria-hidden');
+            const tabindex = e.getAttribute('tabindex');
+            if (ariaHidden === 'true' && tabindex === '-1') continue;
+
+            const tagName = e.tagName;
+            const textContent = (e.textContent || '').trim();
+            const getId = e.getAttribute('id');
+            const getName = e.getAttribute('name');
+            const getHref = e.getAttribute('href');
+            const ariaLabel = e.getAttribute('aria-label');
+            const placeholder = e.getAttribute('placeholder');
+            const dataAct = e.getAttribute('data-act');
+            const roleAttr = e.getAttribute('role');
+            const titleAttr = e.getAttribute('title');
+
+            // Icon-only elements (no text/aria-label/id/name) are dropped unless
+            // they at least carry a title tooltip — see click_by_index icon fix.
+            const isFormish = tagName === 'INPUT' || tagName === 'TEXTAREA' || tagName === 'SELECT';
+            if (!isFormish && !(getId || getName || textContent || getHref || ariaLabel || placeholder || titleAttr)) {
+                continue;
+            }
+
+            const directText = Array.from(e.childNodes)
+                .filter(n => n.nodeType === 3)
+                .map(n => n.textContent.trim())
+                .filter(Boolean).join(' ');
+
+            // combobox/listbox triggers show their CURRENTLY SELECTED VALUE as
+            // their text (e.g. "Banana") — not a stable identifier, since it
+            // changes with every selection. Prefer the adjacent <label> instead.
+            let comboboxLabelText = '';
+            if ((roleAttr === 'combobox' || roleAttr === 'listbox') && !(getId || getName || ariaLabel)) {
+                comboboxLabelText = findLabel(e);
+            }
+
+            const tagLower = tagName.toLowerCase();
+            let suggested = '';
+            if (getId) {
+                suggested = 'xpath=//' + tagLower + '[@id="' + getId + '"]';
+            } else if (getName) {
+                suggested = 'xpath=//' + tagLower + '[@name="' + getName + '"]';
+            } else if (ariaLabel) {
+                suggested = 'xpath=//' + tagLower + '[@aria-label="' + ariaLabel + '"]';
+            } else if (titleAttr) {
+                suggested = 'xpath=//' + tagLower + '[@title="' + titleAttr + '"]';
+            } else if (placeholder) {
+                suggested = 'xpath=//' + tagLower + '[@placeholder="' + placeholder + '"]';
+            } else if (comboboxLabelText) {
+                suggested = 'xpath=//label[normalize-space(.)="' + comboboxLabelText + '"]/following::*[@role="' + roleAttr + '"][1]';
+            } else if (directText || textContent) {
+                const sourceText = directText || textContent;
+                const childTextCount = tagName === 'SELECT'
+                    ? e.options.length
+                    : Array.from(e.children).filter(c => (c.textContent || '').trim()).length;
+                if (childTextCount > 1) {
+                    suggested = '';
+                } else {
+                    const firstLine = sourceText.split('\\n')[0].trim();
+                    suggested = firstLine ? 'xpath=//' + tagLower + '[.//text()[normalize-space(.) = "' + firstLine + '"]]' : '';
+                }
+            } else if (dataAct && !['BUTTON', 'A', 'INPUT', 'SELECT', 'TEXTAREA'].includes(tagName)) {
+                const firstLine = (textContent.split('\\n')[0] || '').trim();
+                suggested = 'xpath=//' + tagLower + '[@data-act="' + dataAct + '" and .//*[normalize-space(.) = "' + firstLine + '"]]';
+            } else if (textContent) {
+                const firstLine = textContent.split('\\n')[0].trim();
+                suggested = firstLine ? 'xpath=//' + tagLower + '[.//text()[normalize-space(.) = "' + firstLine + '"]]' : '';
+            }
+
+            const inputType = tagName === 'INPUT' ? e.getAttribute('type') : null;
+            const inputValue = isFormish ? (e.value ?? null) : null;
+
+            let labelText = comboboxLabelText;
+            if (!suggested && isFormish) {
+                labelText = findLabel(e);
+                if (labelText) {
+                    suggested = '//label[normalize-space(.)="' + labelText + '"]/following::input[1]';
+                }
+            }
+
+            // Row-level disambiguation for repeated icons (one View/Edit/Delete
+            // per table/list row) — see click_by_index icon fix, 2026-07-08.
+            const rowEl = e.closest('tr, [role="row"], li');
+            const rowContext = rowEl ? rowEl.textContent.replace(/\\s+/g, ' ').trim().slice(0, 200) : '';
+
+            // Widget-instance disambiguation: which popup/listbox does this
+            // OPTION belong to? A page with several independent Select/combobox
+            // widgets can have the same option text (or a value already shown
+            // by a different, closed widget) appear more than once — matching
+            // on text alone isn't enough to know which widget's option this is.
+            // See [[project_click_by_index_icon_resolution]] "Banana" case,
+            // 2026-07-09. Only computed for role=option since it's the only
+            // case that needs it.
+            let owningPopupId = '';
+            if (roleAttr === 'option') {
+                const popup = e.closest('[role="listbox"], [role="menu"], [id]');
+                owningPopupId = popup ? (popup.id || '') : '';
+            }
+
+            result.push({
+                id: getId, tag: tagName, type: inputType, value: inputValue,
+                text: textContent, disabled: !!e.disabled,
+                name: getName, href: getHref,
+                role: roleAttr,
+                aria_controls: e.getAttribute('aria-controls'),
+                tabindex: tabindex, aria_hidden: ariaHidden,
+                aria_label: ariaLabel, placeholder: placeholder,
+                title: titleAttr,
+                data_act: dataAct, visible: true,
+                label: labelText,
+                row_context: rowContext,
+                owning_popup_id: owningPopupId,
+                suggested_selector: suggested,
+            });
+        } catch (err) {
+            continue;
+        }
+    }
+    return result;
+}
+"""
+
+
 @register_tool(
     "get_interactable_elements",
     "Return all visible interactable elements on the current page across all frames.",
-    {"type": "object", "properties": {}, "required": []}
+    {"type": "object", "properties": {}, "required": []},
+    # Not in the TOOLS menu — the engine calls this itself to build the
+    # AVAILABLE ELEMENTS block of every prompt; the LLM never requests it by
+    # name, it just consumes the resulting element list.
+    visible_to_llm=False,
 )
 async def cmd_get_interactable_elements(params: dict, session: Session):
     async with session.lock:
@@ -1011,169 +1269,39 @@ async def cmd_get_interactable_elements(params: dict, session: Session):
         result = []
         for frame in session.page.frames:
             try:
-                elements = await frame.query_selector_all(
-                    "button, a, input, textarea, select, "
-                    "[role='button'], [role='link'], [role='combobox'], [role='listbox'], "
-                    "[role='option'], [role='checkbox'], "
-                    "span[role='combobox'], span[role='button'], span[tabindex], "
-                    "[data-act], [data-link]"
-                )
+                frame_elements = await frame.evaluate(_INTERACTABLE_ELEMENTS_JS)
             except Exception:
                 continue
-
-            for el in elements:
-                try:
-                    if not await el.is_visible():
-                        continue
-                except Exception:
-                    continue
-                try:
-                    aria_hidden = await el.get_attribute("aria-hidden")
-                    tabindex = await el.get_attribute("tabindex")
-                    if aria_hidden == "true" and tabindex == "-1":
-                        continue
-
-                    tag_name = await el.evaluate("e => e.tagName")
-                    text_content = (await el.text_content() or "").strip()
-                    get_id = await el.get_attribute("id")
-                    get_name = await el.get_attribute("name")
-                    get_href = await el.get_attribute("href")
-                    aria_label = await el.get_attribute("aria-label")
-                    placeholder = await el.get_attribute("placeholder")
-                    data_act = await el.get_attribute("data-act")
-                    role_attr = await el.get_attribute("role")
-                    title_attr = await el.get_attribute("title")
-
-                    # Icon-only buttons (SVG child, no text/aria-label/id/name) are a
-                    # near-universal pattern — not TCM-specific. Most icon buttons
-                    # across the web rely on the native `title` tooltip attribute
-                    # instead of aria-label for their accessible hint. Without reading
-                    # it, these elements had zero identifying signal, got dropped from
-                    # the candidate list entirely, and forced the matcher to guess at
-                    # an unrelated element instead (e.g. picking a navbar button that
-                    # coincidentally shared one word with the step description).
-                    if tag_name not in ("INPUT", "TEXTAREA", "SELECT") and not (get_id or get_name or text_content or get_href or aria_label or placeholder or title_attr):
-                        continue
-
-                    direct_text = await el.evaluate(
-                        "e => Array.from(e.childNodes)"
-                        ".filter(n => n.nodeType === 3)"
-                        ".map(n => n.textContent.trim())"
-                        ".filter(Boolean).join(' ')"
-                    )
-
-                    # combobox/listbox triggers (Radix/shadcn Select buttons) show
-                    # their CURRENTLY SELECTED VALUE as their text (e.g. "Low") —
-                    # not a stable field identifier. A selector built on that text
-                    # breaks the moment the value differs from whatever it was
-                    # when the selector was generated. Prefer the adjacent <label>
-                    # instead, same idea as the INPUT/SELECT label fallback further
-                    # down, but checked here so it outranks the value-text branch.
-                    combobox_label_text = ""
-                    if role_attr in ("combobox", "listbox") and not (get_id or get_name or aria_label):
-                        combobox_label_text = (await el.evaluate("""e => {
-                            if (e.id) {
-                                const lbl = document.querySelector('label[for="' + e.id + '"]');
-                                if (lbl) return lbl.textContent.trim();
-                            }
-                            let node = e.parentElement;
-                            while (node && node !== document.body) {
-                                const lbl = node.querySelector('label');
-                                if (lbl) return lbl.textContent.trim();
-                                node = node.parentElement;
-                            }
-                            return '';
-                        }""") or "").strip()
-
-                    if get_id:
-                        _suggested = f'xpath=//{tag_name.lower()}[@id="{get_id}"]'
-                    elif get_name:
-                        _suggested = f'xpath=//{tag_name.lower()}[@name="{get_name}"]'
-                    elif aria_label:
-                        _suggested = f'xpath=//{tag_name.lower()}[@aria-label="{aria_label}"]'
-                    elif title_attr:
-                        _suggested = f'xpath=//{tag_name.lower()}[@title="{title_attr}"]'
-                    elif placeholder:
-                        _suggested = f'xpath=//{tag_name.lower()}[@placeholder="{placeholder}"]'
-                    elif combobox_label_text:
-                        _suggested = f'xpath=//label[normalize-space(.)="{combobox_label_text}"]/following::*[@role="{role_attr}"][1]'
-                    elif direct_text or text_content:
-                        source_text = direct_text or text_content
-                        child_text_count = await el.evaluate("""
-                            e => e.tagName === 'SELECT'
-                                ? e.options.length
-                                : Array.from(e.children).filter(c => (c.textContent||'').trim()).length
-                        """)
-                        if child_text_count > 1:
-                            _suggested = ""
-                        else:
-                            first_line = source_text.split('\n')[0].strip()
-                            _suggested = f'xpath=//{tag_name.lower()}[.//text()[normalize-space(.) = "{first_line}"]]' if first_line else ""
-                    elif data_act and tag_name not in ("BUTTON", "A", "INPUT", "SELECT", "TEXTAREA"):
-                        _suggested = f'xpath=//{tag_name.lower()}[@data-act="{data_act}" and .//*[normalize-space(.) = "{text_content.split(chr(10))[0].strip()}"]]'
-                    elif text_content:
-                        first_line = text_content.split('\n')[0].strip()
-                        _suggested = f'xpath=//{tag_name.lower()}[.//text()[normalize-space(.) = "{first_line}"]]' if first_line else ""
-                    else:
-                        _suggested = ""
-
-                    input_type = await el.get_attribute("type") if tag_name == "INPUT" else None
-                    input_value = await el.evaluate("e => e.value ?? null") if tag_name in ("INPUT", "TEXTAREA", "SELECT") else None
-
-                    # For inputs with no usable selector, find the nearest label text
-                    # and build a label-based XPath (handles Vue/OrangeHRM style forms)
-                    label_text = combobox_label_text
-                    if not _suggested and tag_name in ("INPUT", "TEXTAREA", "SELECT"):
-                        label_text = (await el.evaluate("""e => {
-                            if (e.id) {
-                                const lbl = document.querySelector('label[for="' + e.id + '"]');
-                                if (lbl) return lbl.textContent.trim();
-                            }
-                            let node = e.parentElement;
-                            while (node && node !== document.body) {
-                                const lbl = node.querySelector('label');
-                                if (lbl) return lbl.textContent.trim();
-                                node = node.parentElement;
-                            }
-                            return '';
-                        }""") or "").strip()
-                        if label_text:
-                            _suggested = f'//label[normalize-space(.)="{label_text}"]/following::input[1]'
-
-                    # title/aria-label solve WHAT an icon-only element is (View vs
-                    # Delete). They don't solve WHICH instance it is when a table/list
-                    # renders the same icon once per row — "row where Name is 'X'" steps
-                    # need to disambiguate by row content, not just icon identity.
-                    # Walk up to the nearest row-like ancestor (table row, ARIA row, or
-                    # list item — not table-specific) and capture its text so the
-                    # matcher can confirm "this element's row contains X" in addition
-                    # to "this element is a View icon".
-                    row_context = (await el.evaluate("""e => {
-                        const row = e.closest('tr, [role="row"], li');
-                        return row ? row.textContent.replace(/\\s+/g, ' ').trim().slice(0, 200) : '';
-                    }""") or "").strip()
-
-                    result.append({
-                        "id": get_id, "tag": tag_name, "type": input_type, "value": input_value,
-                        "text": text_content, "disabled": await el.evaluate("e => !!e.disabled"),
-                        "name": get_name, "href": get_href,
-                        "role": role_attr,
-                        "aria_controls": await el.get_attribute("aria-controls"),
-                        "tabindex": tabindex, "aria_hidden": aria_hidden,
-                        "aria_label": aria_label, "placeholder": placeholder,
-                        "title": title_attr,
-                        "data_act": data_act, "visible": True,
-                        "in_iframe": frame != session.page.main_frame,
-                        "label": label_text,
-                        "row_context": row_context,
-                        "suggested_selector": _suggested,
-                    })
-                except Exception:
-                    continue
+            is_main = frame == session.page.main_frame
+            for el in frame_elements:
+                el["in_iframe"] = not is_main
+                result.append(el)
     return {"count": len(result), "elements": result}
 
 
 
+@register_tool(
+    "click_by_index",
+    "Click an element identified by its index in the AVAILABLE ELEMENTS list "
+    "(from get_interactable_elements), with drift + relevance checks to "
+    "refuse the click rather than hit the wrong element if the DOM shifted "
+    "between prompt build and execution.",
+    {
+        "type": "object",
+        "properties": {
+            "index": {"type": "integer"},
+            "expected_text": {"type": "string"},
+            # Internal — threaded through from the calling step's own
+            # description by engine.py, not something the LLM sets directly.
+            "step_description": {"type": "string"},
+        },
+        "required": ["index", "expected_text"]
+    },
+    category="action",
+    llm_doc="index (int, from elements list), expected_text (string, exact "
+             "text shown at [index] in AVAILABLE ELEMENTS — required for "
+             "drift detection)",
+)
 async def cmd_click_by_index(params: dict, session: Session):
     index = params.get("index")
     expected_text = (params.get("expected_text") or "").strip()
@@ -1223,7 +1351,7 @@ async def cmd_click_by_index(params: dict, session: Session):
     # NEW: index was structurally valid, now check it's actually relevant to the step
     score = None
     if step_description:
-        score = _relevance_score(step_description, target)
+        score = _relevance_score(step_description, target, session.last_combobox_controls)
 
         # --- TEMP: log every score during the tuning window ---
         print(f"[click_by_index relevance] step={step_description!r} idx={index} text={actual_text!r} score={score}")
@@ -1241,6 +1369,33 @@ async def cmd_click_by_index(params: dict, session: Session):
         return {"error": f"Element at index {index} has no usable selector", "element": target}
     async with session.lock:
         await session.page.click(selector)
+
+    # Remember which popup this click just opened (if any), so the NEXT
+    # click_by_index call — the one that actually picks an option — can be
+    # scored against "does this option belong to the popup we just opened."
+    # Without this, opening trigger #1 then picking "Banana" has no way to
+    # tell that trigger #1's popup is the relevant one when the page has
+    # other Select/combobox widgets whose text coincidentally also says
+    # "Banana". Cleared implicitly by being overwritten on the next trigger
+    # click; intentionally NOT cleared on option-pick, since a step sequence
+    # sometimes re-opens the same trigger (e.g. to change the selection again).
+    #
+    # Gating on role="combobox"/"listbox" turned out too narrow: shadcn's
+    # newer Base UI Select trigger doesn't set an explicit role (relies on
+    # native <button> + aria-haspopup semantics instead of Radix's
+    # role="combobox"), so that check silently never fired and the whole
+    # popup-scoping bonus/penalty stayed dead (score stuck at the pre-fix
+    # baseline). aria-controls itself is the reliable, library-agnostic
+    # signal — by definition it means "this element controls that other DOM
+    # subtree," true whether the widget sets role=combobox, aria-haspopup, or
+    # neither. A false positive here (e.g. a tab/accordion header, which also
+    # uses aria-controls) can only ever hurt an UNRELATED role="option"
+    # candidate elsewhere via the -10 penalty — which pushes it to a refusal
+    # (score <= 0), not a wrong click. Fail-refuse is the acceptable failure
+    # mode here, not silent mis-click.
+    if target.get("aria_controls"):
+        session.last_combobox_controls = target.get("aria_controls")
+
     # element_title/element_aria_label/element_row_context are surfaced so the
     # caller (engine.py) can persist them into the recorded script step. Without
     # this, the saved JSON only has {index, expected_text} — enough to replay
@@ -1276,7 +1431,8 @@ async def _extract_and_save_txt(content: str, ts: str) -> dict:
 @register_tool(
     "get_page_content_and_save_csv",
     "Scrape all HTML tables from the current page and save each as a CSV file.",
-    {"type": "object", "properties": {}, "required": []}
+    {"type": "object", "properties": {}, "required": []},
+    category="extract",
 )
 async def cmd_get_page_content_and_save_csv(params: dict, session: Session):
     async with session.lock:
@@ -1319,7 +1475,8 @@ async def cmd_get_page_content_and_save_csv(params: dict, session: Session):
 @register_tool(
     "get_page_content_and_save_txt",
     "Strip scripts and styles from the current page HTML and save the clean plain text.",
-    {"type": "object", "properties": {}, "required": []}
+    {"type": "object", "properties": {}, "required": []},
+    category="extract",
 )
 async def cmd_get_page_content_and_save_txt(params: dict, session: Session):
     async with session.lock:
@@ -1346,7 +1503,9 @@ async def cmd_get_page_content_and_save_txt(params: dict, session: Session):
             "timeout": {"type": "integer"},
         },
         "required": []
-    }
+    },
+    category="wait_session",
+    llm_doc='state ("load" | "networkidle" | "domcontentloaded"), timeout (ms)',
 )
 async def cmd_wait_for_load(params: dict, session: Session):
     state = params.get("state", "load")
@@ -1367,7 +1526,9 @@ async def cmd_wait_for_load(params: dict, session: Session):
             "timeout": {"type": "integer"},
         },
         "required": ["selector"]
-    }
+    },
+    category="wait_session",
+    llm_doc='selector (XPath), state ("visible" | "hidden"), timeout (ms)',
 )
 async def cmd_wait_for_selector(params: dict, session: Session):
     selector = normalize_selector(params["selector"])
@@ -1379,6 +1540,16 @@ async def cmd_wait_for_selector(params: dict, session: Session):
     return {"selector": selector, "state": state, "timeout": timeout}
 
 
+@register_tool(
+    "execute_js",
+    "Run an arbitrary JS expression via page.evaluate() and return the result. "
+    "Internal escape hatch only — excluded from the LLM's TOOLS menu on "
+    "purpose per the no-JS-evaluate locator policy (see feedback: "
+    "locator strategy standard): step generation must resolve elements via "
+    "semantic locators / XPath, never by asking the LLM to author raw JS.",
+    {"type": "object", "properties": {"script": {"type": "string"}}, "required": ["script"]},
+    visible_to_llm=False,
+)
 async def cmd_execute_js(params: dict, session: Session):
     script = params.get("script", "")
     async with session.lock:
@@ -1389,7 +1560,9 @@ async def cmd_execute_js(params: dict, session: Session):
 @register_tool(
     "press_key",
     "Press a keyboard key on the page.",
-    {"type": "object", "properties": {"key": {"type": "string"}}, "required": []}
+    {"type": "object", "properties": {"key": {"type": "string"}}, "required": []},
+    category="action",
+    llm_doc='key ("Escape" | "Enter" | "Tab" | "ArrowDown" | "ArrowUp" | "Backspace")',
 )
 async def cmd_press_key(params: dict, session: Session):
     key = params.get("key", "Escape")
@@ -1406,7 +1579,9 @@ async def cmd_press_key(params: dict, session: Session):
         "type": "object",
         "properties": {"name": {"type": "string"}},
         "required": ["name"]
-    }
+    },
+    category="wait_session",
+    llm_doc="name (credential name string)",
 )
 async def cmd_get_credentials(params: dict, session: Session):
     name = params.get("name", "")
@@ -1424,7 +1599,9 @@ async def cmd_get_credentials(params: dict, session: Session):
             "timeout": {"type": "integer"},
         },
         "required": ["selector"]
-    }
+    },
+    category="action",
+    llm_doc="selector (XPath)",
 )
 async def cmd_scroll_to_element(params: dict, session: Session):
     sel = normalize_selector(params["selector"])
@@ -1444,12 +1621,20 @@ async def cmd_scroll_to_element(params: dict, session: Session):
             "timeout": {"type": "integer"},
         },
         "required": ["selector"]
-    }
+    },
+    category="action",
+    llm_doc="selector (XPath)",
 )
 async def cmd_double_click(params: dict, session: Session):
     sel = normalize_selector(params["selector"])
     async with session.lock:
         loc = await _find_locator(session.page, sel)
+        try:
+            # See cmd_click: force a centered scroll before acting so the
+            # element doesn't land flush against the viewport edge.
+            await loc.evaluate("el => el.scrollIntoView({block: 'center', inline: 'nearest', behavior: 'instant'})")
+        except Exception:
+            pass
         try:
             await loc.dblclick(timeout=8000)
         except (PlaywrightTimeoutError, PlaywrightError):
@@ -1476,7 +1661,9 @@ async def cmd_double_click(params: dict, session: Session):
             "timeout": {"type": "integer"},
         },
         "required": ["selector"]
-    }
+    },
+    category="action",
+    llm_doc="selector (XPath)",
 )
 async def cmd_clear_input(params: dict, session: Session):
     sel = normalize_selector(params["selector"])
@@ -1498,7 +1685,9 @@ async def cmd_clear_input(params: dict, session: Session):
             "timeout": {"type": "integer"},
         },
         "required": ["selector", "attribute"]
-    }
+    },
+    category="extract",
+    llm_doc='selector (XPath), attribute (e.g. "href")',
 )
 async def cmd_get_attribute(params: dict, session: Session):
     sel = normalize_selector(params["selector"])
@@ -1507,6 +1696,52 @@ async def cmd_get_attribute(params: dict, session: Session):
         loc = await _find_locator(session.page, sel)
         value = await loc.get_attribute(attr, timeout=params.get("timeout", 10000))
     return {"selector": sel, "attribute": attr, "value": value}
+
+
+# Non-interactive text (a stat/counter like "3 events", a status label, etc.)
+# never appears in AVAILABLE ELEMENTS — that scraper only tracks buttons/
+# links/inputs/etc. So the LLM has no way to see whether such text actually
+# exists before guessing an assert_text selector, and ends up cycling through
+# increasingly broad guesses (a specific div → //body) across retries. //body
+# is also actively misleading: Playwright's text_content() on it includes raw
+# <script> tag source (Next.js hydration payloads etc.), so a "match" there
+# can be pure coincidence and a "no match" can hide text that's really on the
+# page just structured differently than guessed. This does one authoritative
+# search across all VISIBLE text (script/style excluded) for the smallest
+# element containing `expected`, so assert_text doesn't depend on the LLM's
+# selector guess being exactly right.
+_FIND_TEXT_ANYWHERE_JS = """
+(expected) => {
+    function isVisible(el) {
+        if (!el.isConnected) return false;
+        const style = window.getComputedStyle(el);
+        if (style.display === 'none' || style.visibility === 'hidden') return false;
+        const rect = el.getBoundingClientRect();
+        if (rect.width === 0 || rect.height === 0) return false;
+        return true;
+    }
+    const skipTags = new Set(['SCRIPT', 'STYLE', 'NOSCRIPT']);
+    const all = document.querySelectorAll('body *');
+    let best = null;
+    let bestLen = Infinity;
+    for (const el of all) {
+        if (skipTags.has(el.tagName)) continue;
+        if (!isVisible(el)) continue;
+        const text = (el.textContent || '').trim();
+        if (text.includes(expected) && text.length < bestLen) {
+            best = el;
+            bestLen = text.length;
+        }
+    }
+    if (!best) return { found: false };
+    return {
+        found: true,
+        text: best.textContent.trim().slice(0, 300),
+        tag: best.tagName,
+        id: best.id || null,
+    };
+}
+"""
 
 
 @register_tool(
@@ -1521,7 +1756,10 @@ async def cmd_get_attribute(params: dict, session: Session):
             "timeout": {"type": "integer"},
         },
         "required": ["selector", "expected"]
-    }
+    },
+    category="verify",
+    llm_doc="selector (XPath), expected (text substring) — for div/span/p/td/li; "
+            "also works on input/textarea (reads value if no inner text)",
 )
 async def cmd_assert_text(params: dict, session: Session):
     sel = normalize_selector(params["selector"])
@@ -1531,31 +1769,90 @@ async def cmd_assert_text(params: dict, session: Session):
     async with session.lock:
         loc = await _find_locator(session.page, sel)
         # Fast existence check — fail early instead of burning the full timeout on a wrong selector
+        selector_attached = True
         try:
             await loc.wait_for(state="attached", timeout=min(timeout, 5000))
         except Exception:
-            raise AssertionError(f"assert_text failed — element not found: {sel!r}\n  expected: {expected!r}")
-        # input_value() is the correct Playwright API for <input>/<select>/<textarea>
+            selector_attached = False
+
         actual = ""
-        try:
-            actual = (await loc.input_value(timeout=3000) or "").strip()
-        except Exception:
-            pass
-        if not actual:
+        select_label = ""
+        if selector_attached:
+            # input_value() is the correct Playwright API for <input>/<select>/<textarea>,
+            # but on a native <select> it returns the selected OPTION'S VALUE
+            # ATTRIBUTE (e.g. "2"), not its visible label ("Option 2") — and since
+            # it doesn't throw for a <select>, the text_content() fallback below
+            # never fired for this case. Test descriptions almost always mean the
+            # visible label. Found 2026-07-09 via a real .py-replay failure
+            # (TC001): expected 'Option 2', got '2'. Capture the selected
+            # option's own text as a second candidate; match against EITHER the
+            # raw value/text OR the label, so a step that intentionally checks
+            # a raw value (e.g. "2") still works too. Same fix mirrored in the
+            # static .py generator (stores.py _assert_text_py).
             try:
-                actual = (await loc.text_content(timeout=3000) or "").strip()
+                tag_name = (await loc.evaluate("el => el.tagName") or "").upper()
+            except Exception:
+                tag_name = ""
+            if tag_name == "SELECT":
+                try:
+                    select_label = (await loc.evaluate(
+                        "el => el.options[el.selectedIndex] ? el.options[el.selectedIndex].text : ''"
+                    ) or "").strip()
+                except Exception:
+                    pass
+            try:
+                actual = (await loc.input_value(timeout=3000) or "").strip()
             except Exception:
                 pass
-        if not actual:
-            actual = (await loc.evaluate("el => el.value || el.textContent || ''") or "").strip()
-    match = (actual == expected) if exact else (expected in actual)
+            if not actual:
+                try:
+                    actual = (await loc.text_content(timeout=3000) or "").strip()
+                except Exception:
+                    pass
+            if not actual:
+                actual = (await loc.evaluate("el => el.value || el.textContent || ''") or "").strip()
+
+        if exact:
+            match = (actual == expected) or (select_label == expected)
+        else:
+            match = (expected in actual) or bool(select_label and expected in select_label)
+        if match and select_label and expected in select_label and expected not in actual:
+            actual = select_label  # report whichever field actually matched
+
+        # Selector either didn't resolve at all, or resolved but didn't contain
+        # the expected text (includes the //body-full-of-script-garbage case,
+        # since that "actual" text technically failed the `expected in actual`
+        # check on its own if the real rendered text isn't part of it). Do one
+        # real search of the visible page before giving up, bounded to a few
+        # retries within the remaining timeout budget — covers async-rendered
+        # counters/stats that just haven't painted yet on the first check.
+        fallback_hit = None
+        if not match and not exact:
+            deadline = time.monotonic() + (timeout / 1000.0)
+            while time.monotonic() < deadline:
+                try:
+                    result = await session.page.evaluate(_FIND_TEXT_ANYWHERE_JS, expected)
+                except Exception:
+                    result = None
+                if result and result.get("found"):
+                    fallback_hit = result
+                    match = True
+                    actual = result.get("text", actual)
+                    break
+                await asyncio.sleep(0.4)
+
     if not match:
         raise AssertionError(
             f"assert_text failed — selector: {sel!r}\n"
             f"  expected: {expected!r}\n"
-            f"  actual:   {actual!r}"
+            f"  actual:   {actual!r}\n"
+            f"  (also searched all visible page text, not found anywhere)"
         )
-    return {"selector": sel, "expected": expected, "actual": actual, "passed": True}
+    result = {"selector": sel, "expected": expected, "actual": actual, "passed": True}
+    if fallback_hit:
+        result["matched_via"] = "full_page_text_search"
+        result["matched_tag"] = fallback_hit.get("tag")
+    return result
 
 
 @register_tool(
@@ -1569,7 +1866,9 @@ async def cmd_assert_text(params: dict, session: Session):
             "timeout":  {"type": "integer", "description": "Max ms to wait for element (default 5000)."},
         },
         "required": ["selector"]
-    }
+    },
+    category="verify",
+    llm_doc="selector (XPath)",
 )
 async def cmd_assert_visible(params: dict, session: Session):
     sel     = normalize_selector(params["selector"])
@@ -1604,7 +1903,9 @@ async def cmd_assert_visible(params: dict, session: Session):
 @register_tool(
     "assert_not_visible",
     "Assert that an element is NOT visible (hidden or absent from the page).",
-    {"type": "object", "properties": {"selector": {"type": "string"}}, "required": ["selector"]}
+    {"type": "object", "properties": {"selector": {"type": "string"}}, "required": ["selector"]},
+    category="verify",
+    llm_doc="selector (XPath)",
 )
 async def cmd_assert_not_visible(params: dict, session: Session):
     sel = normalize_selector(params["selector"])
@@ -1625,7 +1926,9 @@ async def cmd_assert_not_visible(params: dict, session: Session):
 @register_tool(
     "assert_disabled",
     "Assert that an element is disabled.",
-    {"type": "object", "properties": {"selector": {"type": "string"}}, "required": ["selector"]}
+    {"type": "object", "properties": {"selector": {"type": "string"}}, "required": ["selector"]},
+    category="verify",
+    llm_doc="selector (XPath)",
 )
 async def cmd_assert_disabled(params: dict, session: Session):
     sel = normalize_selector(params["selector"])
@@ -1647,7 +1950,9 @@ async def cmd_assert_disabled(params: dict, session: Session):
             "timeout": {"type": "integer"},
         },
         "required": ["expected"]
-    }
+    },
+    category="verify",
+    llm_doc="expected (URL substring)",
 )
 async def cmd_assert_url(params: dict, session: Session):
     expected = params["expected"]
@@ -1677,7 +1982,10 @@ async def cmd_assert_url(params: dict, session: Session):
             "fail_on_error":  {"type": "boolean", "description": "Throw error if toast appears but text/type does not match (default true)."},
         },
         "required": []
-    }
+    },
+    category="verify",
+    llm_doc="expected_text (substring), timeout (ms, default 6000) — waits for a "
+             "toast/popup/snackbar/SweetAlert to appear and validates its text",
 )
 async def cmd_assert_toast(params: dict, session: Session):
     expected_text  = params.get("expected_text") or ""
@@ -1747,7 +2055,14 @@ async def cmd_assert_toast(params: dict, session: Session):
             "verify_filename": {"type": "boolean", "description": "Assert the uploaded filename appears after upload (default true)."},
         },
         "required": ["selector", "files"]
-    }
+    },
+    category="action",
+    llm_doc='selector (XPath targeting <input type="file">), files (path string — '
+            "absolute path, OR a home-folder shortcut like "
+            '"downloads/invoice.pdf" / "desktop/x.png" / "documents/y.docx" '
+            "resolved against the current machine's home directory, exactly as "
+            "written in the step description — do not invent an absolute path "
+            "yourself)",
 )
 async def cmd_upload_file(params: dict, session: Session):
     sel = normalize_selector(params["selector"])
@@ -1830,7 +2145,9 @@ async def cmd_upload_file(params: dict, session: Session):
             "url_contains": {"type": "string"},
         },
         "required": []
-    }
+    },
+    category="action",
+    llm_doc="index (int, 0-based) OR url_contains (string)",
 )
 async def cmd_switch_tab(params: dict, session: Session):
     index = params.get("index")
@@ -1895,3 +2212,12 @@ CMD_MAP = {
 }
 
 VALID_METHODS = list(CMD_MAP.keys())
+
+# Fail loudly at import time if TOOL_REGISTRY (source of the LLM-facing TOOLS
+# prompt, see tool_registry.py) and CMD_MAP (the actual dispatcher) have
+# drifted apart. This is the exact bug class that used to be possible
+# silently: click_by_index was hand-typed into the SYSTEM_PROMPT text and was
+# dispatchable via CMD_MAP, but had no @register_tool entry at all — nothing
+# would have caught that if a future edit removed it from CMD_MAP (or from
+# the prompt) without the other side being updated to match.
+verify_registry_matches(CMD_MAP.keys())

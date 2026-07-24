@@ -33,10 +33,21 @@ _CRITICAL_STEP_KEYWORDS = ["login", "log in", "masuk", "submit"]
 
 
 async def _emit_and_persist(db, state: RunState, result: dict, step_index: int, step_desc: str) -> None:
-    """Emit step_end SSE event and persist step to DB."""
+    """Emit step_end SSE event and persist step to DB.
+
+    Single choke point for every step outcome (credential bypass, upload
+    bypass, LLM path, etc. all funnel through here) — so this is also where
+    the run-level pass/fail tally lives. Do not compute step ok/fail anywhere
+    else; add new step-result paths here instead of duplicating the counter.
+    """
+    ok = result.get("ok", False)
+    if ok:
+        state.pass_count += 1
+    else:
+        state.fail_count += 1
+
     _emit_step_end(state, result, step_index, step_desc)
     if db:
-        ok = result.get("ok", False)
         await db_upsert_step(
             db,
             run_id=state.run_id,
@@ -434,8 +445,11 @@ async def run_test_case(
                 break
 
         # ── Finalize ──────────────────────────────────────────────────────────
+        # Overall status must reflect every step's outcome, not just whether a
+        # "critical" step (login/submit) triggered an early stop. Non-critical
+        # failures still fail the run — they just don't abort execution early.
         if state.status != "stopped" and state.status != "failed":
-            state.status = "passed"
+            state.status = "failed" if state.fail_count > 0 else "passed"
 
     except asyncio.CancelledError:
         state.status = "stopped"

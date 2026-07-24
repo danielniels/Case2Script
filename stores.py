@@ -36,6 +36,15 @@ class Session:
         self.lock = asyncio.Lock()
         self.command_history: list = []
         self.last_used: float = asyncio.get_event_loop().time()
+        # Tracks the aria-controls id of the last combobox/listbox trigger that
+        # was clicked open, so a following click_by_index step ("pick option X
+        # from the list") can be scoped to options belonging to THAT specific
+        # popup. Without this, a page with multiple Select/dropdown instances
+        # (e.g. a component-library docs page with several demo widgets) can
+        # have a candidate option's text coincidentally collide with a value
+        # already shown by a DIFFERENT, unrelated widget elsewhere on the page —
+        # see [[project_click_by_index_icon_resolution]] "Banana" case, 2026-07-09.
+        self.last_combobox_controls: Optional[str] = None
 
     def touch(self):
         self.last_used = asyncio.get_event_loop().time()
@@ -517,6 +526,40 @@ def _icon_button_selector_py(tag: str, identity_attr: str, identity_value: str,
     )
 
 
+def _button_text_selector_py(tag: str, text: str, row_label: Optional[str] = None) -> str:
+    """Build a Playwright XPath for a click_by_index target identified by its
+    own visible text — the common case, e.g. a plain `<button>Log In</button>`.
+    This is the THIRD shape click_by_index needs alongside
+    _icon_button_selector_py (title/aria-label, no text) and
+    _text_option_selector_py (role="option"/cmdk-item, combobox picks).
+
+    Found missing 2026-07-09: a recorded step "Click the login button" had no
+    element_title/element_aria_label (a plain text button has neither), so
+    normalization fell through to _text_option_selector_py — which builds a
+    role="option"/cmdk-item selector. That's structurally wrong for a normal
+    button and always times out. element_text (already returned by
+    cmd_click_by_index, tools.py) is the correct identity source here and is
+    checked FIRST in the normalization chain below, before title/aria-label,
+    since icon buttons naturally have empty text and fall through unaffected.
+
+    Same row-scoping support as _icon_button_selector_py for consistency,
+    though most text-identified buttons (login, tab labels, etc.) won't have
+    a row_label since they're not per-row.
+
+    Known limitation: same as sibling functions — a `"` inside text/row_label
+    breaks the XPath string literal; not handled.
+    """
+    tag = (tag or "button").lower()
+    base = f'//{tag}[.//text()[normalize-space(.) = "{text}"]]'
+    if not row_label:
+        return base
+    return (
+        f'//tr[contains(normalize-space(.), "{row_label}")]{base}'
+        f' | //*[@role="row"][contains(normalize-space(.), "{row_label}")]{base}'
+        f' | //li[contains(normalize-space(.), "{row_label}")]{base}'
+    )
+
+
 def _js_click_click_py(selector: str) -> str:
     """One click block — same isVisible+xpath/css lookup JS used by the 'click'
     template, parameterized on selector. Used to replay ARIA-combobox
@@ -763,6 +806,23 @@ _SEL_ID = re.compile(r'^(?:xpath=)?//\w+\[@id\s*=\s*["\']([^"\']+)["\']\]$', re.
 _SEL_NAME = re.compile(r'^(?:xpath=)?//\w+\[@name\s*=\s*["\']([^"\']+)["\']\]$', re.I)
 _SEL_PLACEHOLDER = re.compile(r'^(?:xpath=)?//\w+\[@placeholder\s*=\s*["\']([^"\']+)["\']\]$', re.I)
 _SEL_ARIA_LABEL = re.compile(r'^(?:xpath=)?//\w+\[@aria-label\s*=\s*["\']([^"\']+)["\']\]$', re.I)
+# Icon-only elements identified by their title tooltip (see prompts.py:
+# "Icon-only buttons ... carry their identity in title="). Unlike id/name/
+# aria-label, title is frequently NOT unique across a page — responsive
+# sites commonly render a desktop nav AND a mobile nav simultaneously in the
+# DOM, each with its own icon carrying the identical title (e.g. two
+# <a title="USER"> nodes, one hidden via CSS media query at the current
+# viewport). Before this pattern existed, _classify_selector_py returned
+# None for title-based xpaths, which skipped click_with_fallback entirely
+# and fell straight to the unprotected `page.locator(xpath).first.click()`
+# path (see _click_py) — `.first` picks DOM order, not visibility, so it
+# can silently resolve to the hidden twin and time out waiting for it to
+# become visible. Found 2026-07-23 via advantageonlineshopping.com's navbar
+# (title="USER" duplicated across desktop/mobile nav blocks). Appending
+# `:visible` (a native Playwright CSS extension, not a JS-evaluate hack —
+# consistent with the no-JS-evaluate locator standard) filters the match
+# down to whichever twin is actually rendered right now.
+_SEL_TITLE = re.compile(r'^(?:xpath=)?//(\w+)\[@title\s*=\s*["\']([^"\']+)["\']\]$', re.I)
 _SEL_TEXT = re.compile(
     r'^(?:xpath=)?//(\w+)\[(?:\.//text\(\)|text\(\))\[normalize-space\(\.\)\s*=\s*'
     r'(?:"([^"]*)"|\'([^\']*)\')\]\]$'
@@ -801,6 +861,13 @@ def _classify_selector_py(selector: str) -> Optional[str]:
     if m:
         return f"page.get_by_label({_py(m.group(1))}, exact=True)"
 
+    m = _SEL_TITLE.match(s)
+    if m:
+        tag = m.group(1).lower()
+        title = m.group(2).replace('\\', '\\\\').replace('"', '\\"')
+        css = f'{tag}[title="{title}"]:visible'
+        return f"page.locator({_py(css)})"
+
     m = _SEL_TEXT.match(s)
     if m:
         tag = m.group(1).lower()
@@ -822,7 +889,7 @@ def _classify_selector_py(selector: str) -> Optional[str]:
 # page.evaluate() force-click this replaces, which bypassed them entirely
 # and could "succeed" against an element a real user couldn't reach.
 _LOCATOR_HELPER_PY = (
-    'async def click_with_fallback(page, primary, xpath_fallback, desc, timeout=6000):\n'
+    'async def click_with_fallback(page, primary, xpath_fallback, desc, timeout=15000):\n'
     '    try:\n'
     '        await primary.click(timeout=timeout)\n'
     '    except Exception:\n'
@@ -830,7 +897,7 @@ _LOCATOR_HELPER_PY = (
     '        await page.locator(xpath_fallback).first.click(timeout=timeout)\n'
     '\n'
     '\n'
-    'async def fill_with_fallback(page, primary, value, xpath_fallback, desc, timeout=6000):\n'
+    'async def fill_with_fallback(page, primary, value, xpath_fallback, desc, timeout=15000):\n'
     '    try:\n'
     '        await primary.fill(value, timeout=timeout)\n'
     '    except Exception:\n'
@@ -843,14 +910,28 @@ def _click_py(p: dict) -> str:
     selector = p.get('selector', '')
     primary = _classify_selector_py(selector)
     desc = _py(selector[:80])
+    # timeout=15000, not the old 6000: Playwright's own actionability polling
+    # (attached/visible/stable/enabled) already retries the WHOLE window, so a
+    # longer budget costs nothing when the element shows up quickly — it only
+    # matters on the slow-render case this was raised for. Found 2026-07-09:
+    # a click_by_index step immediately following a client-side SPA route
+    # change (sidebar nav click, no full page reload) needs the destination
+    # view's data (e.g. a table fetched async) to render before the next
+    # step's target exists. Verified the row-scoped XPath itself was 100%
+    # correct via a standalone lxml XPath test against the real page HTML —
+    # the failure was purely a timing race, not a selector bug. 6000ms +
+    # the ~2.4s of settle time after the PRIOR click (load/networkidle/400ms)
+    # wasn't consistently enough. This is universal (any click that follows
+    # a client-side navigation can hit the same race), not specific to
+    # click_by_index/icon buttons — hence the bump applies to every click.
     if primary:
-        body = f"await click_with_fallback(page, {primary}, {_py(selector)}, {desc}, timeout=6000)\n"
+        body = f"await click_with_fallback(page, {primary}, {_py(selector)}, {desc}, timeout=15000)\n"
     else:
         # No known semantic shape recognized (see _classify_selector_py) —
         # use the recorded XPath/CSS directly via native click(), same
         # selector as before. No JS-evaluate force-click anymore anywhere:
         # Playwright's own actionability wait replaces it.
-        body = f"await page.locator({_py(selector)}).first.click(timeout=6000)\n"
+        body = f"await page.locator({_py(selector)}).first.click(timeout=15000)\n"
     return (
         body +
         f"try:\n"
@@ -872,7 +953,7 @@ def _fill_py(p: dict) -> str:
     primary = _classify_selector_py(selector)
     desc = _py(selector[:80])
     if primary:
-        action = f"await fill_with_fallback(page, {primary}, {_py(text)}, {_py(selector)}, {desc}, timeout=6000)"
+        action = f"await fill_with_fallback(page, {primary}, {_py(text)}, {_py(selector)}, {desc}, timeout=15000)"
     else:
         action = f"await page.locator({_py(selector)}).first.fill({_py(text)})"
     return (
@@ -881,6 +962,50 @@ def _fill_py(p: dict) -> str:
         f"except Exception:\n"
         f"    await page.screenshot(path=f'{{SCREENSHOT_DIR}}/FAILED.png')\n"
         f"    raise"
+    )
+
+
+def _assert_text_py(p: dict) -> str:
+    """assert_text template. input_value() is the correct Playwright API for
+    <input>/<textarea>, but on a native <select> it returns the selected
+    OPTION'S VALUE ATTRIBUTE (e.g. "2"), not its visible label ("Option 2")
+    — and since input_value() doesn't throw for a <select>, the old
+    text_content() fallback (only reached on exception) never fired. Test
+    descriptions almost always mean the visible label. Found 2026-07-09 via
+    a real replay failure (TC001): expected 'Option 2', got '2'. Fixed by
+    detecting <select> and also capturing the selected option's own text as
+    a second candidate — match succeeds against EITHER the raw
+    input_value()/text_content() OR the select's label, so scripts that
+    intentionally assert against a raw value (e.g. "2") still work too.
+    Same defect existed in the live engine's cmd_assert_text (tools.py),
+    fixed there in the same way — this is not select-specific to one test
+    case, applies to every assert_text step targeting a <select>."""
+    selector = p.get('selector', '')
+    expected = p.get('expected', '')
+    return (
+        f"_loc = page.locator({_py(selector)}).first\n"
+        f"_select_label = ''\n"
+        f"try:\n"
+        f"    if ((await _loc.evaluate('el => el.tagName')) or '').upper() == 'SELECT':\n"
+        f"        _select_label = ((await _loc.evaluate(\"el => el.options[el.selectedIndex] ? el.options[el.selectedIndex].text : ''\")) or '').strip()\n"
+        f"except Exception:\n"
+        f"    pass\n"
+        f"try:\n"
+        f"    t = (await _loc.input_value()).strip()\n"
+        f"except Exception:\n"
+        f"    t = (await _loc.text_content() or '').strip()\n"
+        f"if not t:\n"
+        f"    try:\n"
+        f"        t = (await _loc.text_content() or '').strip()\n"
+        f"    except Exception:\n"
+        f"        pass\n"
+        f"_expected = {_py(expected)}\n"
+        f"_match = (_expected in t) or bool(_select_label and _expected in _select_label)\n"
+        f"if _match and _select_label and _expected in _select_label and _expected not in t:\n"
+        f"    t = _select_label\n"
+        f"if not _match:\n"
+        f"    _detail = f\", select_label={{_select_label!r}}\" if _select_label else ''\n"
+        f"    raise AssertionError(f\"assert_text failed — expected {{_expected!r}}, got: {{t}}{{_detail}}\")"
     )
 
 
@@ -944,15 +1069,7 @@ _PY_TEMPLATES = {
 
     "upload_file": _upload_file_py,
 
-    "assert_text": lambda p: (
-        f"_loc = page.locator({_py(p['selector'])}).first\n"
-        f"try:\n"
-        f"    t = (await _loc.input_value()).strip()\n"
-        f"except Exception:\n"
-        f"    t = (await _loc.text_content() or '').strip()\n"
-        f"if {_py(p['expected'])} not in t:\n"
-        f"    raise AssertionError(f\"assert_text failed — expected {p['expected']!r}, got: {{t}}\")"
-    ),
+    "assert_text": _assert_text_py,
     "assert_visible": lambda p: (
         f"if not await page.locator({_py(p['selector'])}).first.is_visible():\n"
         f"    raise AssertionError(f\"assert_visible failed: {{{_py(p['selector'])}}}\")"
@@ -1136,18 +1253,47 @@ def generate_playwright_py_from_json(json_path: str) -> Optional[str]:
         # DOM/mount ordering.
         _fallback_label = params.get("expected_text") or _extract_quoted_label(desc)
         if method == "click_by_index":
-            # Icon-only action button (View/Edit/Delete — identified by title or
-            # aria-label, no visible text) vs. a combobox/listbox option pick are
-            # two different shapes that both went through click_by_index. Prefer
-            # the icon-button shape whenever the recorder captured it (added
-            # 2026-07-08 — see engine.py/tools.py); older recordings made before
-            # that fall through to the option-selector guess below unchanged.
+            # Three possible identity sources for a click_by_index target, all
+            # captured by cmd_click_by_index/engine.py at recording time, tried
+            # in priority order:
+            #  1. element_text — plain buttons/links identified by their own
+            #     visible text (e.g. "Log In"). This is the MOST common case for
+            #     click_by_index and is checked first; icon buttons naturally
+            #     have empty text so they fall through to case 2 unaffected.
+            #  2. element_title / element_aria_label — icon-only action button
+            #     (View/Edit/Delete), no visible text.
+            #  3. Neither present (older recording made before this metadata was
+            #     captured, added 2026-07-08/09) — fall back to the
+            #     option-selector guess, which is only correct for genuine
+            #     combobox/listbox option picks. Kept only for backward
+            #     compatibility with old recordings.
+            _row_label = _extract_quoted_label(desc)
+            _element_text = (params.get("element_text") or "").strip()
             _identity_attr = "title" if params.get("element_title") else (
                 "aria-label" if params.get("element_aria_label") else None)
             _identity_value = params.get("element_title") or params.get("element_aria_label")
-            if _identity_attr and _identity_value:
+            # A quoted phrase in the description is only a genuine row_label
+            # when it names something OTHER than the target itself — e.g.
+            # "row where Name is 'X'" or "click 'X'" on a per-row Edit icon.
+            # Plain steps like `Click the "REGISTER" button.` also contain a
+            # quoted phrase, but it's just the button's own label restated in
+            # quotes — not a row identifier. Without this check, _row_label ==
+            # _element_text (both "REGISTER") and _button_text_selector_py
+            # wraps the selector in //tr[contains(...,"REGISTER")]/[role=row]/
+            # //li[...], which is structurally wrong for a plain submit button
+            # that isn't inside any row/list at all, and always times out.
+            # Found 2026-07-23 on advantageonlineshopping.com's register form.
+            if _row_label and _row_label.strip().casefold() in (
+                _element_text.casefold(), (_identity_value or "").strip().casefold()
+            ):
+                _row_label = None
+            if _element_text:
                 method = "click"
-                _row_label = _extract_quoted_label(desc)
+                params["selector"] = _button_text_selector_py(
+                    params.get("element_tag", "button"), _element_text, _row_label
+                )
+            elif _identity_attr and _identity_value:
+                method = "click"
                 params["selector"] = _icon_button_selector_py(
                     params.get("element_tag", "button"), _identity_attr, _identity_value, _row_label
                 )

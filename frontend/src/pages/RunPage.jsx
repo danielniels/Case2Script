@@ -73,9 +73,9 @@ const PROMPT_PLACEHOLDER =
 5. Verify the dashboard is shown`
 
 const TABS = [
-  { id: 'json',   label: 'JSON' },
-  { id: 'excel',  label: 'Excel' },
   { id: 'prompt', label: 'Prompt' },
+  { id: 'excel',  label: 'Excel' },
+  { id: 'json',   label: 'JSON' },
 ]
 
 export default function RunPage() {
@@ -84,7 +84,7 @@ export default function RunPage() {
   const { runId, setRunId, runStatus, setRunStatus, allSteps, setAllSteps, latestScreenshot, setLatestScreenshot } = useContext(RunContext)
 
   // ── Input mode ─────────────────────────────────────────────────────────────
-  const [inputMode, setInputMode]     = useState('json')
+  const [inputMode, setInputMode]     = useState('prompt')
 
   // JSON
   const [jsonInput, setJsonInput]     = useState('')
