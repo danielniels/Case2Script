@@ -1221,6 +1221,35 @@ _INTERACTABLE_ELEMENTS_JS = """
                 owningPopupId = popup ? (popup.id || '') : '';
             }
 
+            // Grid/list-position disambiguation: a step like "click the first
+            // product that appears" / "klik produk pertama" has NO keyword to
+            // match against — the element's identity IS its position in a
+            // repeated card/row pattern, not its text. _relevance_score has no
+            // way to confirm that kind of instruction on its own, so give it a
+            // structural signal here: walk up a few ancestors looking for a
+            // parent with >=3 same-tag children (the actual grid/list
+            // container), and record this element's 0-based index + the
+            // group size among those siblings. >=3 is deliberate — two same-tag
+            // siblings elsewhere on the page (e.g. two nav buttons) shouldn't
+            // count as a "list", real product/result grids always have more.
+            // See [[project_click_by_index_icon_resolution]] for the sibling
+            // precedent (row_context/owning_popup_id above).
+            let siblingGroupIndex = -1;
+            let siblingGroupSize = 0;
+            {
+                let node = e;
+                for (let depth = 0; depth < 4 && node.parentElement; depth++) {
+                    const parent = node.parentElement;
+                    const sameTagSiblings = Array.from(parent.children).filter(c => c.tagName === node.tagName);
+                    if (sameTagSiblings.length >= 3) {
+                        siblingGroupIndex = sameTagSiblings.indexOf(node);
+                        siblingGroupSize = sameTagSiblings.length;
+                        break;
+                    }
+                    node = parent;
+                }
+            }
+
             result.push({
                 id: getId, tag: tagName, type: inputType, value: inputValue,
                 text: textContent, disabled: !!e.disabled,
@@ -1234,6 +1263,8 @@ _INTERACTABLE_ELEMENTS_JS = """
                 label: labelText,
                 row_context: rowContext,
                 owning_popup_id: owningPopupId,
+                sibling_group_index: siblingGroupIndex,
+                sibling_group_size: siblingGroupSize,
                 suggested_selector: suggested,
             });
         } catch (err) {

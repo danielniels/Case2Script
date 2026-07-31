@@ -53,6 +53,12 @@ for _stream in (sys.stdout, sys.stderr):
 import tools        # noqa: F401
 import credentials  # noqa: F401
 
+# Real MCP (Model Context Protocol) surface — must import AFTER tools/
+# credentials above, since it reads TOOL_REGISTRY/CMD_MAP at import time to
+# build the tool list. See mcp_protocol.py's module docstring for why this
+# is separate from the /mcp endpoint below.
+import mcp_protocol
+
 from engine import dispatch, execute_step, get_session
 from helpers import clean_excel_formula
 from stores import (
@@ -95,8 +101,19 @@ async def lifespan(app: FastAPI):
         app.state.scripts = ScriptStore()
         from orchestrator.run_state import RunRegistry
         app.state.runs = RunRegistry()
+
+        # Hand the same Playwright driver + SessionManager to the MCP
+        # surface — its tool wrappers have no FastAPI Request to pull
+        # these from (see mcp_protocol.py::bind docstring).
+        mcp_protocol.bind(pw, sessions)
+
         print("[Lifespan] Playwright + DB started.")
-        yield
+        # FastMCP's Streamable HTTP transport needs its own internal
+        # session-manager task group started via this lifespan, or every
+        # /mcp/v1 request 500s with "Task group is not initialized."
+        # Verified locally (fastmcp 3.4.4) before wiring this in.
+        async with mcp_protocol.mcp_app.lifespan(app):
+            yield
         await sessions.stop_reaper()
 
     await db_conn.close()
@@ -115,7 +132,14 @@ _MCP_API_KEY = os.getenv("MCP_API_KEY", "")
 
 class APIKeyMiddleware(BaseHTTPMiddleware):
     async def dispatch(self, request: Request, call_next):
-        if _MCP_API_KEY and request.url.path == "/mcp":
+        # startswith, not ==  — /mcp/v1/* (the new real-MCP surface, mounted
+        # as a sub-app) is a different path than the legacy /mcp endpoint,
+        # and would otherwise ship with NO auth at all: a bigger hole than
+        # the endpoint it's meant to upgrade, since it can drive a real
+        # browser. Gate both under the same key until there's a reason to
+        # split them.
+        guarded = request.url.path == "/mcp" or request.url.path.startswith("/mcp/v1")
+        if _MCP_API_KEY and guarded:
             key = request.headers.get("X-API-Key", "")
             if key != _MCP_API_KEY:
                 return JSONResponse({"ok": False, "error": "Unauthorized"}, status_code=401)
@@ -130,6 +154,12 @@ app.add_middleware(APIKeyMiddleware)
 app.include_router(orchestrator_router, prefix="/runs", tags=["orchestrator"])
 app.include_router(suites_router, prefix="/suites", tags=["suites"])
 app.include_router(converters_router, prefix="/convert", tags=["converters"])
+
+# Real MCP (Model Context Protocol) surface — Streamable HTTP transport,
+# spec-compliant (initialize / tools/list / tools/call). Separate from the
+# legacy /mcp JSON-RPC-lite endpoint below, which the internal orchestrator
+# keeps using unchanged. See mcp_protocol.py's module docstring.
+app.mount("/mcp/v1", mcp_protocol.mcp_app)
 
 
 # ==================== /mcp Endpoint ====================

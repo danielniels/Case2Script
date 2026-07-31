@@ -241,6 +241,27 @@ _INPUT_WORDS = frozenset({
 # 'Adding new tes Requirement'" -> "Adding new tes Requirement".
 _QUOTED_LABEL_RE = re.compile(r"['\"]([^'\"]{1,80})['\"]")
 
+# Ordinal words -> 0-based position (English + Indonesian). -1 means "last",
+# resolved against sibling_group_size at score time since it's a negative
+# index into the group, not a literal position.
+_ORDINAL_WORDS = {
+    'first': 0, 'pertama': 0, 'satu': 0, '1st': 0,
+    'second': 1, 'kedua': 1, '2nd': 1,
+    'third': 2, 'ketiga': 2, '3rd': 2,
+    'last': -1, 'terakhir': -1,
+}
+
+
+def _ordinal_index_from_step(step_description: str) -> Optional[int]:
+    """Pull an ordinal position out of a step description, e.g. "Click the
+    first product that appears" -> 0, "klik produk pertama" -> 0, "click the
+    last item" -> -1. Returns None if no ordinal word is present — most
+    steps aren't positional and shouldn't get the structural bypass below."""
+    for word in re.split(r'[^a-zA-Z0-9]+', step_description.lower()):
+        if word in _ORDINAL_WORDS:
+            return _ORDINAL_WORDS[word]
+    return None
+
 
 def _relevance_score(step_description: str, el: dict, last_combobox_controls: str = None) -> int:
     step_tokens = set(re.split(r'[^a-zA-Z0-9]+', step_description.lower()))
@@ -303,6 +324,27 @@ def _relevance_score(step_description: str, el: dict, last_combobox_controls: st
             score += 5
         elif owning and owning != last_combobox_controls:
             score -= 10
+
+    # Ordinal/positional instructions ("click the first product that
+    # appears" / "klik produk pertama") have no keyword to overlap with —
+    # the target's own text (a product name, price, etc.) shares zero tokens
+    # with a generic instruction like that BY DESIGN. Every score source
+    # above requires some kind of text/label match, so this class of step
+    # always scored 0 and got hard-refused by cmd_click_by_index even when
+    # the right element was picked (tools.py). Confirm it structurally
+    # instead: if the step names a position and this element sits at that
+    # exact position within a real repeated group (sibling_group_size >= 3 —
+    # set in tools.py's get_interactable_elements scraper), that's as valid
+    # an identity signal as matching text is for named targets. Gated on a
+    # real group size so two unrelated same-tag elements elsewhere on the
+    # page (nav buttons, etc.) can't accidentally satisfy "first".
+    ordinal = _ordinal_index_from_step(step_description)
+    group_size = el.get('sibling_group_size') or 0
+    if ordinal is not None and group_size >= 3:
+        group_index = el.get('sibling_group_index')
+        target_index = ordinal if ordinal >= 0 else group_size + ordinal
+        if group_index is not None and group_index == target_index:
+            score += 6
 
     step_words = set(step_description.lower().split())
     tag = (el.get('tag') or '').upper()
